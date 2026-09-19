@@ -43,6 +43,12 @@ RUN echo "== building web ==" && npm run build -w apps/web
 FROM base AS runtime
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
+# Next reads next.config.mjs again when the server STARTS, not only when it
+# builds — so the folder has to be set here too. Without it the bundle asks for
+# /crm while the server answers at /, and every page is a 404 from an image
+# that built perfectly. Build-stage ENV does not cross into this stage.
+ARG NEXT_PUBLIC_BASE_PATH=
+ENV NEXT_PUBLIC_BASE_PATH=$NEXT_PUBLIC_BASE_PATH
 COPY --from=build /app /app
 EXPOSE 3000 4000
 # Overridden by compose per service (api runs migrations then boots; web serves).
