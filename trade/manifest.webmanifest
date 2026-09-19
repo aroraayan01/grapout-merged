@@ -1,0 +1,19 @@
+{
+  "name": "GrapOut — Buyers and suppliers, one network.",
+  "short_name": "GrapOut",
+  "description": "Tasks, reminders, notes, files, chat, calls, habits and goals in one personal assistant.",
+  "start_url": "/trade/",
+  "scope": "/trade/",
+  "display": "standalone",
+  "background_color": "#07090f",
+  "theme_color": "#07090f",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

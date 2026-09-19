@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Builds
+dist/
+build/
+.next/
+out/
+
+# Env
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Prisma
+apps/api/prisma/*.db
+
+# Embedded Postgres data dir (no-Docker dev)
+apps/api/.pgdata/
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test / coverage
+coverage/
+
+# Build cache
+*.tsbuildinfo
+
+# Redis runtime dump (bundled portable Redis, no-Docker dev)
+.redis/dump.rdb
+*.rdb
+
+# Redis debug symbols + downloaded archive (keep only the runnable binaries)
+.redis/*.pdb
+.redis/*.zip

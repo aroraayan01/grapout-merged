@@ -1,0 +1,74 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #e6e8f2;
+}
+
+body {
+  /* Muted, subtly indigo-tinted canvas — deeper than off-white so the white
+     cards clearly lift off the page. */
+  background:
+    radial-gradient(1200px 600px at 100% -10%, rgba(124, 58, 237, 0.12), transparent 60%),
+    radial-gradient(1000px 500px at -10% 10%, rgba(79, 70, 229, 0.10), transparent 55%),
+    var(--bg);
+  background-attachment: fixed;
+  color: #0f172a;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl border border-slate-200/70 bg-white shadow-soft transition-shadow;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center rounded-lg px-4 py-2 text-sm font-medium transition-all;
+  }
+  /* Gradient primary with a soft glow that lifts on hover. */
+  .btn-primary {
+    @apply btn bg-brand-gradient text-white shadow-soft hover:shadow-glow hover:brightness-105 active:brightness-95;
+  }
+  .btn-ghost {
+    @apply btn border border-slate-200 bg-white text-slate-700 hover:border-brand-200 hover:bg-brand-50/60 hover:text-brand-700;
+  }
+  .input {
+    @apply w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none transition focus:border-brand-500 focus:ring-2 focus:ring-brand-100;
+  }
+  .label {
+    @apply mb-1 block text-sm font-medium text-slate-700;
+  }
+}
+
+/* Gentle entrance for page content. */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+main > * {
+  animation: fade-in-up 0.35s ease-out;
+}
+
+/* Slimmer, tinted scrollbars. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #c7d2fe transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #c7d2fe;
+  border-radius: 9999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #a5b4fc;
+}

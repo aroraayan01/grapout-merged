@@ -1,0 +1,1 @@
+import{i as e}from"./x-BX3vgr2B.js";import{t}from"./Directory-ZEuhBvJi.js";import{n}from"./ProductGrid-DNLvU8lk.js";import{t as r}from"./ProductSheet-CHeEzLnp.js";import{t as i}from"./TradeShell-D8LBThhl.js";var a=e();function o(){let[e,o]=n();return(0,a.jsxs)(i,{children:[(0,a.jsx)(t,{inApp:!1}),e&&(0,a.jsx)(r,{uuid:e,onClose:o,viaTrade:!0})]})}export{o as default};

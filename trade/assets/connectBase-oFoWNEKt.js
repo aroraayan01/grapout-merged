@@ -1,0 +1,1 @@
+import{kr as e}from"./index-Bx5WKudo.js";function t(){let{pathname:t}=e();return``}export{t};

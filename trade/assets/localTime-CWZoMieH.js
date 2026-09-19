@@ -1,0 +1,1 @@
+function e(e){if(!e)return null;let t=new Date(e);return Number.isNaN(t.getTime())?e:t.toISOString()}export{e as t};

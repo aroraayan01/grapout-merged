@@ -1,0 +1,1 @@
+import{n as e}from"./x-BX3vgr2B.js";var t=e(`forward`,[[`path`,{d:`m15 17 5-5-5-5`,key:`nf172w`}],[`path`,{d:`M4 18v-2a4 4 0 0 1 4-4h12`,key:`jmiej9`}]]);export{t};

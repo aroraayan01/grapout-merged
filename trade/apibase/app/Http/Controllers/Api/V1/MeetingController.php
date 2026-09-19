@@ -1,0 +1,1029 @@
+<?php
+
+namespace App\Http\Controllers\Api\V1;
+
+use App\Events\MeetingSignal;
+use App\Http\Controllers\Controller;
+use App\Models\Meeting;
+use App\Services\LiveKitTokenService;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+
+/**
+ * Meet-style link meetings: create a meeting, share its code/link, anyone
+ * signed in with the code can join. Media runs over the same WebRTC mesh
+ * as calls; this controller handles rooms, membership, and signalling relay.
+ */
+class MeetingController extends Controller
+{
+    /** My meetings: hosted or attended, active/upcoming first. */
+    public function index(Request $request): JsonResponse
+    {
+        $me = $request->user();
+
+        $meetings = Meeting::with(['host:id,uuid,name', 'host.businessPage', 'participants:id,uuid,name', 'participants.businessPage'])
+            ->withCount(['participants as joined_count' => fn ($q) => $q->where('meeting_participants.status', 'joined')])
+            ->where('is_screen', $request->boolean('screen'))
+            ->where(fn ($q) => $q->where('host_id', $me->id)
+                ->orWhereHas('participants', fn ($p) => $p->where('users.id', $me->id)))
+            ->orderByRaw("CASE status WHEN 'active' THEN 0 WHEN 'scheduled' THEN 1 ELSE 2 END")
+            ->latest()
+            ->limit(50)
+            ->get()
+            ->map(fn ($m) => $this->serialize($m, $request));
+
+        return response()->json(['data' => $meetings]);
+    }
+
+    public function store(Request $request): JsonResponse
+    {
+        abort_if($request->user()->featureBlocked('meetings'), 403, 'Meetings are switched off for this account by the GrapOut team.');
+        $data = $request->validate([
+            'title' => ['nullable', 'string', 'max:255'],
+            'type' => ['sometimes', 'in:audio,video'],
+            'is_screen' => ['sometimes', 'boolean'],
+            'requires_approval' => ['sometimes', 'boolean'],
+            'passcode' => ['sometimes', 'nullable', 'string', 'min:4', 'max:12', 'alpha_num'],
+            'scheduled_at' => ['sometimes', 'nullable', 'date'],
+            /*
+             * How the media travels, if the host cares. Omitted — which is what
+             * every existing client sends — leaves it undecided, and the room
+             * works it out from its own size the way it always has.
+             */
+            'transport' => ['sometimes', 'nullable', 'in:mesh,sfu'],
+        ]);
+
+        $meeting = Meeting::create([
+            'host_id' => $request->user()->id,
+            'code' => Meeting::generateCode(),
+            'title' => $data['title'] ?? null,
+            'type' => $data['type'] ?? 'video',
+            'is_screen' => (bool) ($data['is_screen'] ?? false),
+            'requires_approval' => (bool) ($data['requires_approval'] ?? true),
+            // Also the guest switch: with a password set, the invite link works
+            // for people who have no account and type it.
+            'passcode' => ($data['passcode'] ?? null) ?: null,
+            'scheduled_at' => $data['scheduled_at'] ?? null,
+        ]);
+
+        // Not in the create() above: transport is not fillable, and the service
+        // is the only thing that writes it. Ignores anything but a real choice.
+        app(LiveKitTokenService::class)->pinTransport($meeting, $data['transport'] ?? null);
+
+        return response()->json([
+            'message' => 'Meeting created — share the code or link to invite people.',
+            'data' => $this->serialize($meeting->load('host:id,uuid,name'), $request),
+        ], 201);
+    }
+
+    /**
+     * Invite people who have an account, instead of sending them a link.
+     *
+     * A meeting was share-a-link only: the host copied a URL and found their
+     * own way to deliver it. That works for someone you are already talking
+     * to and not at all for a meeting booked for Thursday — there was nothing
+     * to remind, because nobody was on the meeting to remind.
+     *
+     * Attaching them as 'invited' is what makes the reminder possible: the
+     * scheduler notifies a meeting's participants, and until now a scheduled
+     * meeting had none until people started arriving.
+     */
+    public function invite(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+        abort_unless($meeting->host_id === $me->id, 403, 'Only the host can invite people to this meeting.');
+        abort_if($meeting->status === 'ended', 410, 'This meeting has ended.');
+
+        $data = $request->validate([
+            'app_ids' => ['required', 'array', 'max:50'],
+            'app_ids.*' => ['string', 'max:32'],
+        ]);
+
+        $service = app(\App\Services\AppIdService::class);
+        $already = $meeting->participants()->pluck('users.id');
+
+        $people = collect($data['app_ids'])
+            ->map(fn ($appId) => $service->findVisibleUser($appId, $me))
+            ->filter(fn ($user) => $user && $user->id !== $me->id)
+            ->unique('id')
+            // Someone already on the meeting is not invited again — a host
+            // adding one more name should not re-ring everybody else.
+            ->reject(fn ($user) => $already->contains($user->id))
+            ->values();
+
+        if ($people->isEmpty()) {
+            return response()->json(['message' => 'Nobody new to invite.'], 422);
+        }
+
+        $meeting->participants()->syncWithoutDetaching(
+            $people->mapWithKeys(fn ($user) => [$user->id => ['status' => 'invited']])->all()
+        );
+
+        $title = $meeting->title ?: 'a meeting';
+
+        foreach ($people as $person) {
+            $when = $meeting->scheduled_at?->timezone($person->profile?->timezone ?? config('app.timezone'));
+
+            $person->notify(new \App\Notifications\SocialNotification(
+                'meeting_invite',
+                $when
+                    ? "{$me->name} invited you to {$title} on " . $when->format('D j M, g:ia') . '.'
+                    : "{$me->name} invited you to {$title}.",
+                ['meeting_code' => $meeting->code, 'title' => $meeting->title],
+                "/meetings/room/{$meeting->code}",
+            ));
+        }
+
+        return response()->json([
+            'message' => 'Invited ' . $people->pluck('name')->join(', ', ' and ') . '.',
+        ]);
+    }
+
+    /** Look up a meeting by its code (the "open the link" step). */
+    public function show(Request $request, Meeting $meeting): JsonResponse
+    {
+        return response()->json(['data' => $this->serialize($meeting->load('host:id,uuid,name'), $request)]);
+    }
+
+    /** Join: anyone signed in with the code. Returns peers already in the room. */
+    public function join(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+        abort_if($me->featureBlocked('meetings'), 403, 'Meetings are switched off for this account by the GrapOut team.');
+        abort_if($meeting->status === 'ended', 410, 'This meeting has ended.');
+
+        /*
+         * Out of time, and nobody has been by to notice — the heartbeat that
+         * normally spots this only runs for people already inside.
+         *
+         * First of all the checks, because it outranks them: a meeting that is
+         * both full and finished should say it is finished, or the person
+         * turned away goes looking for a seat that was never the problem.
+         */
+        if ($meeting->isOverrun()) {
+            $meeting->endNow();
+            abort(410, 'This meeting has ended — it reached the time limit on the host\'s plan.');
+        }
+
+        $data = $request->validate([
+            'display_name' => ['sometimes', 'nullable', 'string', 'max:50'],
+            'mic_on' => ['sometimes', 'boolean'],
+            'cam_on' => ['sometimes', 'boolean'],
+        ]);
+
+        $moderator = $meeting->canModerate($me);
+        $myPivot = $meeting->participants()->where('users.id', $me->id)->first()?->pivot;
+
+        // Being removed means removed: the link alone must not let someone
+        // walk straight back in. A host who changes their mind re-admits them
+        // (that flips the status back to "admitted").
+        abort_if(
+            $myPivot?->status === 'removed',
+            403,
+            'You were removed from this meeting.',
+        );
+
+        // Locked room: the host shut the door. Moderators still get back in
+        // (e.g. after a refresh), everyone else is turned away.
+        abort_if($meeting->is_locked && ! $moderator, 423, 'This meeting is locked — the host is not letting anyone else in.');
+
+        /*
+         * Room size, from the host's plan.
+         *
+         * Two people are never turned away. Someone already in the room is
+         * reconnecting after a refresh or a tunnel, and refusing them would
+         * make a full meeting impossible to rejoin rather than merely hard to
+         * enter. And the host is never locked out of their own meeting — being
+         * one over is a smaller wrong than the person paying for the room
+         * standing outside it.
+         */
+        $limit = $meeting->participantLimit();
+        if ($limit !== null && $myPivot?->status !== 'joined' && $meeting->host_id !== $me->id) {
+            $inRoom = $meeting->participants()->wherePivot('status', 'joined')->count();
+            abort_if(
+                $inRoom >= $limit,
+                409,
+                "This meeting is full — {$meeting->host->name}'s plan allows {$limit} people at once.",
+            );
+        }
+
+        // No passcode is asked for here, by anyone. A guest already typed it to
+        // be given a pass at all, and that pass is only good for this meeting;
+        // a signed-in member is already identified by their account, which is
+        // the thing the password stands in for. Who gets kept out is the
+        // waiting room's job, and the host's.
+
+        // Waiting room: non-hosts must be admitted first (unless bypassed or
+        // previously admitted/inside).
+        if ($meeting->requires_approval && ! $moderator) {
+            $everAdmitted = $myPivot && in_array($myPivot->status, ['joined', 'left', 'admitted'], true);
+            if (! $everAdmitted) {
+                $meeting->participants()->syncWithoutDetaching([
+                    $me->id => [
+                        'status' => 'waiting',
+                        'display_name' => $data['display_name'] ?? null,
+                    ],
+                ]);
+                \App\Support\Realtime::send(new MeetingSignal(
+                    $meeting,
+                    $me->uuid,
+                    $data['display_name'] ?? $me->name,
+                    $meeting->host->uuid,
+                    'knock',
+                ));
+
+                return response()->json([
+                    'message' => 'Waiting for the host to let you in.',
+                    'data' => ['waiting' => true],
+                ], 202);
+            }
+        }
+
+        if ($meeting->status !== 'active') {
+            $meeting->update(['status' => 'active', 'started_at' => $meeting->started_at ?? now()]);
+        }
+
+        $joined = $meeting->inRoom($me->id);
+
+        // Keep an existing co-host promotion across a refresh.
+        $myRole = $meeting->host_id === $me->id ? 'host' : $meeting->roleFor($me);
+        $meeting->participants()->syncWithoutDetaching([
+            $me->id => [
+                'status' => 'joined',
+                'role' => $myRole,
+                'joined_at' => now(),
+                'last_seen_at' => now(),
+                'left_at' => null,
+                'mic_on' => (bool) ($data['mic_on'] ?? true),
+                'cam_on' => (bool) ($data['cam_on'] ?? true),
+                'hand_raised' => false,
+                'display_name' => $data['display_name'] ?? null,
+            ],
+        ]);
+
+        /*
+         * Settle the transport before announcing the arrival, not after.
+         *
+         * This person may be the one who tips the room past what the mesh can
+         * carry, and the room finding that out on its next heartbeat would mean
+         * up to fifteen seconds of everybody dialling a peer who has already
+         * been told to use the SFU. Deciding first makes "somebody arrived" and
+         * "we are moving" one event instead of two, so the mesh clients start
+         * migrating in the same instant the new tile appears.
+         */
+        $wasOn = $meeting->transport;
+        $transport = app(LiveKitTokenService::class)->settleTransport($meeting);
+        $escalated = $transport === 'sfu' && $wasOn !== 'sfu';
+
+        // Tell everyone already inside that a participant arrived (for the roster).
+        $myName = $data['display_name'] ?? $me->name;
+        foreach ($joined as $peer) {
+            \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $myName, $peer->uuid, 'join'));
+            if ($escalated) {
+                \App\Support\Realtime::send(new MeetingSignal(
+                    $meeting, $me->uuid, $myName, $peer->uuid, 'transport', ['transport' => 'sfu'],
+                ));
+            }
+        }
+
+        $meeting = $meeting->fresh()->load('host:id,uuid,name');
+
+        return response()->json([
+            'message' => 'Joined.',
+            'data' => $this->serialize($meeting, $request) + [
+                'joined_peers' => $joined->map(fn ($u) => $this->rosterEntry($meeting, $u))->values(),
+                'heartbeat_seconds' => (int) floor(Meeting::PRESENCE_TIMEOUT_SECONDS / 3),
+            ],
+        ]);
+    }
+
+    /**
+     * Presence ping. Without this a closed tab or dead connection would leave
+     * a ghost in the room forever; mypa:reap-meetings sweeps anyone who stops
+     * calling it. Doubles as the poll that tells a client the meeting ended
+     * or that someone is knocking.
+     */
+    public function heartbeat(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+
+        if ($meeting->status === 'ended') {
+            return response()->json(['data' => [
+                'status' => 'ended',
+                // Said here too, not only on the poll that first noticed: a
+                // client one beat behind, or one reconnecting afterwards, would
+                // otherwise be told the host ended a meeting the host never
+                // touched.
+                'ended_reason' => $meeting->endedBecauseOfTime() ? 'time_limit' : null,
+                'participants' => [],
+                'waiting' => [],
+            ]]);
+        }
+
+        // Time's up. Every client polls this, so this is where a running
+        // meeting notices — the reaper is only for rooms nobody is polling.
+        if ($meeting->isOverrun()) {
+            $meeting->endNow();
+
+            return response()->json(['data' => [
+                'status' => 'ended',
+                'ended_reason' => 'time_limit',
+                'participants' => [],
+                'waiting' => [],
+            ]]);
+        }
+
+        $touched = $meeting->participants()
+            ->where('users.id', $me->id)
+            ->wherePivot('status', 'joined')
+            ->exists();
+        abort_unless($touched, 409, 'You are not in this meeting.');
+
+        $meeting->participants()->updateExistingPivot($me->id, ['last_seen_at' => now()]);
+
+        $roster = $meeting->inRoom()->map(fn ($u) => $this->rosterEntry($meeting, $u))->values();
+
+        // Moderators also get the knock list, so a refresh doesn't lose the
+        // people still waiting outside.
+        $waiting = $meeting->canModerate($me)
+            ? $meeting->participants()->wherePivot('status', 'waiting')->get()
+                ->map(fn ($u) => ['uuid' => $u->uuid, 'name' => $u->pivot->display_name ?? $u->name])->values()
+            : collect();
+
+        return response()->json(['data' => [
+            'status' => $meeting->status,
+            'is_locked' => $meeting->is_locked,
+            'spotlight_uuid' => $meeting->spotlight_uuid,
+            'participants' => $roster,
+            'waiting' => $waiting,
+            // So the room can count down and warn before it happens, rather
+            // than everyone being dropped without notice.
+            'expires_at' => $meeting->expiresAt()?->toIso8601String(),
+            'participant_limit' => $meeting->participantLimit(),
+            /*
+             * The transport, on every beat.
+             *
+             * A room that outgrows the mesh escalates to the SFU while people
+             * are sitting in it, so this is the instruction to move. The signal
+             * sent on the join that tipped it over is what makes that prompt;
+             * this is what makes it certain — a browser whose websocket was
+             * asleep, throttled in a background tab, or reconnecting misses the
+             * signal entirely and would otherwise be the one person left on a
+             * transport the rest of the room has abandoned. Which is not a
+             * degraded meeting. It is a person alone in an empty room while
+             * everyone else carries on without noticing.
+             *
+             * One string every fifteen seconds to close that off.
+             */
+            'transport' => app(LiveKitTokenService::class)->settleTransport($meeting),
+        ]]);
+    }
+
+    public function leave(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+        $meeting->participants()->syncWithoutDetaching([
+            $me->id => ['status' => 'left', 'left_at' => now(), 'hand_raised' => false],
+        ]);
+
+        $remaining = $meeting->inRoom($me->id);
+        foreach ($remaining as $peer) {
+            \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $me->name, $peer->uuid, 'leave'));
+        }
+
+        // Room empties out -> meeting ends by itself.
+        if ($remaining->isEmpty()) {
+            if ($meeting->status === 'active') {
+                $meeting->update(['status' => 'ended', 'ended_at' => now(), 'spotlight_uuid' => null]);
+            }
+
+            return response()->json(['message' => 'Left the meeting.']);
+        }
+
+        // The host walked out but the meeting carries on: hand the controls to
+        // a co-host, or failing that to whoever has been here longest, so the
+        // room is never left with nobody able to moderate it.
+        if ($meeting->host_id === $me->id) {
+            /*
+             * A guest cannot inherit a meeting.
+             *
+             * They are a row that exists for half an hour and is hidden from
+             * ordinary user queries, so handing them the meeting left it owned
+             * by somebody the host relation could not resolve: every later read
+             * of that meeting died on "Attempt to read property uuid on null",
+             * which took out the whole meetings list, not just this room. It is
+             * also simply wrong — the meeting outlives them, and they never had
+             * an account to own it with.
+             */
+            $successor = $remaining
+                ->reject(fn ($u) => $u->isGuest())
+                ->sortBy(fn ($u) => [$u->pivot->role === 'cohost' ? 0 : 1, (string) $u->pivot->joined_at])
+                ->first();
+
+            // Only guests left. Ownership stays where it is, so the meeting
+            // remains readable and the host still owns it if they come back;
+            // nobody in the room is given controls they should not have.
+            if ($successor !== null) {
+                $meeting->update(['host_id' => $successor->id]);
+                $meeting->participants()->updateExistingPivot($successor->id, ['role' => 'host']);
+                // Step down on the way out. This row was left saying 'host',
+                // so walking back into the meeting later showed two of them —
+                // the deliberate hand-over further down has always done this.
+                $meeting->participants()->updateExistingPivot($me->id, ['role' => 'cohost']);
+                $this->tellRoom($meeting, $me, $me->name, 'role', [
+                    'uuid' => $successor->uuid,
+                    'role' => 'host',
+                    'previous_host' => $me->uuid,
+                    'auto' => true,
+                ]);
+            }
+        }
+
+        return response()->json(['message' => 'Left the meeting.']);
+    }
+
+    /**
+     * A LiveKit join token, for a meeting running on the SFU.
+     *
+     * Deliberately narrow: it hands out a credential, so it answers only for
+     * somebody the room has already admitted. Being in the meeting is the
+     * check — join() does the deciding about passcodes, locks, the waiting
+     * room, plan limits and removals, and this refuses anyone it has not
+     * already let through. Minting a token for someone still knocking would
+     * route around every one of those.
+     */
+    public function realtimeToken(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+        $livekit = app(\App\Services\LiveKitTokenService::class);
+
+        abort_unless($livekit->configured(), 503, 'Real-time media is not configured on this server.');
+        abort_if($meeting->status === 'ended', 410, 'This meeting has ended.');
+
+        $pivot = $meeting->participants()->where('users.id', $me->id)->first()?->pivot;
+        abort_unless($pivot?->status === 'joined', 403, 'Join the meeting first.');
+
+        return response()->json(['data' => [
+            'url' => config('livekit.url'),
+            'room' => $livekit->roomFor($meeting),
+            'token' => $livekit->tokenFor(
+                $meeting,
+                $me,
+                $pivot->display_name ?? $me->name,
+                $meeting->canModerate($me),
+            ),
+        ]]);
+    }
+
+    /**
+     * Remove a meeting from the list for good.
+     *
+     * There was no way to do this, so a meeting created and then not used —
+     * one press of "New meeting" that was backed out of, a duplicate, a
+     * mistake — stayed in the list for ever with nothing to be done about it.
+     * Ending a meeting is not the same as never having wanted it.
+     */
+    public function destroy(Request $request, Meeting $meeting): JsonResponse
+    {
+        abort_unless($meeting->host_id === $request->user()->id, 403, 'Only the host can delete a meeting.');
+        abort_if(
+            $meeting->status === 'active',
+            409,
+            'This meeting is running. End it first, then delete it.',
+        );
+
+        // Chat files are on disk, not just in the database: dropping the rows
+        // alone would leave the bytes behind for ever.
+        foreach ($meeting->files as $file) {
+            \Illuminate\Support\Facades\Storage::disk('local')->delete($file->path);
+        }
+        $meeting->delete();
+
+        return response()->json(['message' => 'Meeting deleted.']);
+    }
+
+    /** Host ends the meeting for everyone. */
+    public function end(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+        abort_unless($meeting->host_id === $me->id, 403, 'Only the host can end the meeting for everyone.');
+
+        $meeting->update(['status' => 'ended', 'ended_at' => now(), 'spotlight_uuid' => null]);
+
+        $joined = $meeting->participants()->wherePivot('status', 'joined')->where('users.id', '!=', $me->id)->get();
+        foreach ($joined as $peer) {
+            \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $me->name, $peer->uuid, 'end'));
+        }
+        $meeting->participants()->newPivotStatement()
+            ->where('meeting_id', $meeting->id)->where('status', 'joined')
+            ->update(['status' => 'left', 'left_at' => now()]);
+
+        return response()->json(['message' => 'Meeting ended for everyone.']);
+    }
+
+    /** Host lets a waiting person in (or turns them away). */
+    public function admit(Request $request, Meeting $meeting): JsonResponse
+    {
+        abort_unless($meeting->canModerate($request->user()), 403, 'Only the host or a co-host can admit people.');
+
+        $data = $request->validate([
+            'user_uuid' => ['required', 'uuid'],
+            'allow' => ['required', 'boolean'],
+        ]);
+
+        /*
+         * Resolve the person from this meeting's own participants, not from
+         * User at large.
+         *
+         * A guest is a user row hidden behind a global scope, so the plain
+         * lookup this used to do could never find one: admitting a guest threw
+         * a 404 the client discarded, the knock came straight back on the next
+         * heartbeat, and the host clicked Admit over and over on somebody the
+         * server would not let in. Going through the relation asks for guests
+         * back — and confines the whole thing to people actually waiting here,
+         * rather than any uuid in the database.
+         */
+        $target = $meeting->participants()->where('users.uuid', $data['user_uuid'])->first();
+        abort_unless($target, 404, 'Nobody by that name is waiting for this meeting.');
+        $meeting->participants()->syncWithoutDetaching([
+            $target->id => ['status' => $data['allow'] ? 'admitted' : 'denied'],
+        ]);
+
+        \App\Support\Realtime::send(new MeetingSignal(
+            $meeting,
+            $request->user()->uuid,
+            $request->user()->name,
+            $target->uuid,
+            $data['allow'] ? 'admitted' : 'denied',
+        ));
+
+        return response()->json(['message' => $data['allow'] ? "{$target->name} admitted." : "{$target->name} turned away."]);
+    }
+
+    /**
+     * Set or clear the meeting password.
+     *
+     * This is the guest switch. With a password, the ordinary invite link works
+     * for someone who has no account: they are asked for a name and the
+     * password instead of being sent to sign in. Without one, the link is for
+     * signed-in members only. The instant "New meeting" button — the one most
+     * people press — creates no password, so this has to be reachable from
+     * inside the room rather than only at creation time.
+     */
+    public function setPasscode(Request $request, Meeting $meeting): JsonResponse
+    {
+        abort_unless($meeting->canModerate($request->user()), 403, 'Only the host or a co-host can change this.');
+
+        $data = $request->validate([
+            'passcode' => ['present', 'nullable', 'string', 'min:4', 'max:12', 'alpha_num'],
+        ]);
+
+        $meeting->update(['passcode' => $data['passcode'] ?: null]);
+
+        return response()->json([
+            'message' => $meeting->passcode
+                ? 'Password set — anyone with the link can now join with it, account or not.'
+                : 'Password removed — the link is for signed-in members only again.',
+            'data' => [
+                'passcode' => $meeting->passcode,
+                'has_passcode' => (bool) $meeting->passcode,
+                'allows_guests' => $meeting->allowsGuests(),
+            ],
+        ]);
+    }
+
+    /** Host toggles the waiting room on/off mid-meeting (the bypass). */
+
+    public function setApproval(Request $request, Meeting $meeting): JsonResponse
+    {
+        abort_unless($meeting->canModerate($request->user()), 403, 'Only the host or a co-host can change this.');
+        $data = $request->validate(['requires_approval' => ['required', 'boolean']]);
+        $meeting->update(['requires_approval' => $data['requires_approval']]);
+
+        return response()->json([
+            'message' => $data['requires_approval']
+                ? 'Approval required: new joiners now wait for you.'
+                : 'Open access: anyone with the link joins directly.',
+        ]);
+    }
+
+    /**
+     * Everything a host (or co-host) can do to the room and the people in it.
+     * One endpoint because they all share the same permission check and the
+     * same "tell the room what changed" tail.
+     */
+    public function hostAction(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+        abort_unless($meeting->canModerate($me), 403, 'Only the host or a co-host can do that.');
+
+        $data = $request->validate([
+            'action' => ['required', 'in:mute,mute_all,ask_unmute,stop_video,remove,lock,unlock,promote,demote,transfer_host,spotlight,clear_spotlight'],
+            'user_uuid' => ['required_unless:action,mute_all,lock,unlock,clear_spotlight', 'nullable', 'uuid'],
+        ]);
+
+        $action = $data['action'];
+        $myName = $meeting->participants()->where('users.id', $me->id)->first()?->pivot->display_name ?? $me->name;
+
+        // Room-wide switches first — they need no target.
+        if (in_array($action, ['lock', 'unlock'], true)) {
+            $meeting->update(['is_locked' => $action === 'lock']);
+            $this->tellRoom($meeting, $me, $myName, 'lock', ['locked' => $action === 'lock']);
+
+            return response()->json(['message' => $action === 'lock'
+                ? 'Meeting locked — nobody else can join.'
+                : 'Meeting unlocked.']);
+        }
+
+        if ($action === 'clear_spotlight') {
+            $meeting->update(['spotlight_uuid' => null]);
+            $this->tellRoom($meeting, $me, $myName, 'spotlight', ['uuid' => null]);
+
+            return response()->json(['message' => 'Spotlight cleared.']);
+        }
+
+        if ($action === 'mute_all') {
+            $meeting->participants()->newPivotStatement()
+                ->where('meeting_id', $meeting->id)
+                ->where('status', 'joined')
+                ->where('user_id', '!=', $me->id)
+                ->update(['mic_on' => false]);
+            $this->tellRoom($meeting, $me, $myName, 'host-mute', ['all' => true]);
+
+            return response()->json(['message' => 'Everyone else has been muted.']);
+        }
+
+        // Everything below targets one participant.
+        $target = $meeting->participants()->where('users.uuid', $data['user_uuid'])->first();
+        abort_unless($target, 422, 'That participant is not in this meeting.');
+        abort_if($target->id === $me->id, 422, 'That one is for other people, not you.');
+        // A co-host cannot act on the host.
+        abort_if($target->id === $meeting->host_id, 403, 'You cannot do that to the host.');
+
+        $targetName = $target->pivot->display_name ?? $target->name;
+
+        switch ($action) {
+            case 'mute':
+                $meeting->participants()->updateExistingPivot($target->id, ['mic_on' => false]);
+                \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $myName, $target->uuid, 'host-mute', []));
+                $message = "{$targetName} muted.";
+                break;
+
+            case 'ask_unmute':
+                \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $myName, $target->uuid, 'host-ask-unmute', []));
+                $message = "Asked {$targetName} to unmute.";
+                break;
+
+            case 'stop_video':
+                $meeting->participants()->updateExistingPivot($target->id, ['cam_on' => false]);
+                \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $myName, $target->uuid, 'host-stop-video', []));
+                $message = "{$targetName}'s camera stopped.";
+                break;
+
+            case 'remove':
+                \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $myName, $target->uuid, 'removed', []));
+                $meeting->participants()->updateExistingPivot($target->id, [
+                    'status' => 'removed', 'left_at' => now(),
+                ]);
+                // The rest of the room drops their peer connection to them.
+                foreach ($meeting->inRoom($me->id) as $peer) {
+                    if ($peer->id === $target->id) {
+                        continue;
+                    }
+                    \App\Support\Realtime::send(new MeetingSignal($meeting, $target->uuid, $targetName, $peer->uuid, 'leave', []));
+                }
+                $message = "{$targetName} was removed.";
+                break;
+
+            case 'promote':
+            case 'demote':
+                $role = $action === 'promote' ? 'cohost' : 'participant';
+                $meeting->participants()->updateExistingPivot($target->id, ['role' => $role]);
+                $this->tellRoom($meeting, $me, $myName, 'role', ['uuid' => $target->uuid, 'role' => $role]);
+                $message = $action === 'promote' ? "{$targetName} is now a co-host." : "{$targetName} is no longer a co-host.";
+                break;
+
+            case 'transfer_host':
+                abort_unless($meeting->host_id === $me->id, 403, 'Only the host can hand over the meeting.');
+                // Same reason the automatic hand-over refuses them: a guest is
+                // gone in half an hour and owns no account to keep it with.
+                abort_if($target->isGuest(), 422, 'A guest cannot be made the host — they have no GrapOut account.');
+                $meeting->update(['host_id' => $target->id]);
+                $meeting->participants()->updateExistingPivot($target->id, ['role' => 'host']);
+                $meeting->participants()->updateExistingPivot($me->id, ['role' => 'cohost']);
+                $this->tellRoom($meeting, $me, $myName, 'role', [
+                    'uuid' => $target->uuid, 'role' => 'host', 'previous_host' => $me->uuid,
+                ]);
+                $message = "{$targetName} is now the host.";
+                break;
+
+            case 'spotlight':
+                $meeting->update(['spotlight_uuid' => $target->uuid]);
+                $this->tellRoom($meeting, $me, $myName, 'spotlight', ['uuid' => $target->uuid]);
+                $message = "{$targetName} is spotlighted for everyone.";
+                break;
+
+            default:
+                abort(422, 'Unknown action.');
+        }
+
+        return response()->json(['message' => $message]);
+    }
+
+    /** In-meeting chat: to everyone, or privately to one participant. */
+    public function chat(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+        abort_unless($meeting->status === 'active', 409, 'Meeting is not active.');
+        $myPivot = $meeting->participants()->where('users.id', $me->id)->wherePivot('status', 'joined')->first()?->pivot;
+        abort_unless($myPivot !== null, 403, 'Join the meeting first.');
+
+        $data = $request->validate([
+            'message' => ['required', 'string', 'max:1000'],
+            'to_uuid' => ['sometimes', 'nullable', 'uuid'],
+        ]);
+
+        $fromName = $myPivot->display_name ?? $me->name;
+        $payload = ['message' => $data['message'], 'private' => ! empty($data['to_uuid'])];
+
+        if (! empty($data['to_uuid'])) {
+            $target = $meeting->participants()->where('users.uuid', $data['to_uuid'])->wherePivot('status', 'joined')->first();
+            abort_unless($target && $target->id !== $me->id, 422, 'That participant is not in the meeting.');
+            \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $fromName, $target->uuid, 'chat', $payload));
+        } else {
+            $others = $meeting->participants()->wherePivot('status', 'joined')->where('users.id', '!=', $me->id)->get();
+            foreach ($others as $peer) {
+                \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $fromName, $peer->uuid, 'chat', $payload));
+            }
+        }
+
+        return response()->json(['message' => 'sent']);
+    }
+
+    /**
+     * Share a file/image in the meeting chat. The file lives with the meeting
+     * (participants-only download) and a chat signal announces it - to
+     * everyone or privately.
+     */
+    public function chatFile(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+        abort_unless($meeting->status === 'active', 409, 'Meeting is not active.');
+        $myPivot = $meeting->participants()->where('users.id', $me->id)->wherePivot('status', 'joined')->first()?->pivot;
+        abort_unless($myPivot !== null, 403, 'Join the meeting first.');
+
+        $data = $request->validate([
+            'file' => ['required', 'file', 'max:10240'], // 10 MB
+            'to_uuid' => ['sometimes', 'nullable', 'uuid'],
+        ]);
+
+        $upload = $data['file'];
+        \App\Support\UploadGuard::assertSafe($upload);
+
+        // Counts against the sharer's storage quota, like any other upload.
+        if (! app(\App\Services\SubscriptionEntitlementService::class)->canUploadBytes($me, (int) $upload->getSize())) {
+            return response()->json([
+                'message' => 'Sharing this file would take you over your storage limit.',
+            ], 422);
+        }
+
+        $path = $upload->store('meeting-files/' . $meeting->id, 'local');
+        $file = \App\Models\MeetingFile::create([
+            'meeting_id' => $meeting->id,
+            'user_id' => $me->id,
+            'path' => $path,
+            'name' => $upload->getClientOriginalName(),
+            'mime' => $upload->getClientMimeType(),
+            'size' => $upload->getSize(),
+        ]);
+
+        $fromName = $myPivot->display_name ?? $me->name;
+        $payload = [
+            'message' => '',
+            'private' => ! empty($data['to_uuid']),
+            'file' => [
+                'uuid' => $file->uuid,
+                'name' => $file->name,
+                'mime' => $file->mime,
+                'size' => $file->size,
+            ],
+        ];
+
+        if (! empty($data['to_uuid'])) {
+            $target = $meeting->participants()->where('users.uuid', $data['to_uuid'])->wherePivot('status', 'joined')->first();
+            abort_unless($target && $target->id !== $me->id, 422, 'That participant is not in the meeting.');
+            \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $fromName, $target->uuid, 'chat', $payload));
+        } else {
+            $others = $meeting->participants()->wherePivot('status', 'joined')->where('users.id', '!=', $me->id)->get();
+            foreach ($others as $peer) {
+                \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $fromName, $peer->uuid, 'chat', $payload));
+            }
+        }
+
+        return response()->json(['message' => 'Shared.', 'data' => $payload['file']]);
+    }
+
+    /** Download a chat file - meeting participants only. */
+    public function chatFileDownload(Request $request, Meeting $meeting, \App\Models\MeetingFile $file)
+    {
+        abort_unless($file->meeting_id === $meeting->id, 404);
+        abort_unless(
+            $meeting->participants()->where('users.id', $request->user()->id)->exists()
+                || $meeting->host_id === $request->user()->id,
+            403
+        );
+
+        return \Illuminate\Support\Facades\Storage::disk('local')->download($file->path, $file->name);
+    }
+
+    /** Broadcast an emoji reaction (or raised hand) to everyone in the room. */
+    public function react(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+        abort_unless($meeting->status === 'active', 409, 'Meeting is not active.');
+        $myPivot = $meeting->participants()->where('users.id', $me->id)->wherePivot('status', 'joined')->first()?->pivot;
+        abort_unless($myPivot !== null, 403, 'Join the meeting first.');
+
+        $data = $request->validate([
+            'emoji' => ['required', 'in:thumbsup,clap,heart,laugh,wow,party,hand,hand_down,yes,no,slower,faster'],
+        ]);
+
+        // A raised hand outlives the burst animation, so it is state, not an
+        // event — persist it for the roster and for anyone joining later.
+        if (in_array($data['emoji'], ['hand', 'hand_down'], true)) {
+            $meeting->participants()->updateExistingPivot($me->id, ['hand_raised' => $data['emoji'] === 'hand']);
+        }
+
+        $others = $meeting->participants()->wherePivot('status', 'joined')->where('users.id', '!=', $me->id)->get();
+        foreach ($others as $peer) {
+            \App\Support\Realtime::send(new MeetingSignal(
+                $meeting,
+                $me->uuid,
+                $myPivot->display_name ?? $me->name,
+                $peer->uuid,
+                'react',
+                ['emoji' => $data['emoji']],
+            ));
+        }
+
+        return response()->json(['message' => 'ok']);
+    }
+
+    /** Change what I am called in THIS meeting; everyone inside sees it live. */
+    public function rename(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+        abort_unless(
+            $meeting->participants()->where('users.id', $me->id)->wherePivot('status', 'joined')->exists(),
+            403,
+            'Join the meeting first.'
+        );
+
+        $data = $request->validate(['display_name' => ['required', 'string', 'max:50']]);
+        $name = trim($data['display_name']);
+        abort_if($name === '', 422, 'Name cannot be empty.');
+
+        $meeting->participants()->updateExistingPivot($me->id, ['display_name' => $name]);
+
+        $others = $meeting->participants()->wherePivot('status', 'joined')->where('users.id', '!=', $me->id)->get();
+        foreach ($others as $peer) {
+            \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $name, $peer->uuid, 'rename', ['name' => $name]));
+        }
+
+        return response()->json(['message' => "You will appear as {$name} in this meeting."]);
+    }
+
+    /** Relay WebRTC signalling to one specific participant. */
+    public function signal(Request $request, Meeting $meeting): JsonResponse
+    {
+        $me = $request->user();
+        abort_unless($meeting->status === 'active', 409, 'Meeting is not active.');
+        abort_unless(
+            $meeting->participants()->where('users.id', $me->id)->wherePivot('status', 'joined')->exists(),
+            403,
+            'Join the meeting first.'
+        );
+
+        $data = $request->validate([
+            'signal' => ['required', 'in:offer,answer,ice,share,record,media,rec-request,rec-allow,rec-deny'],
+            'payload' => ['sometimes', 'array'],
+            'to_uuid' => ['required', 'uuid'],
+        ]);
+
+        $target = $meeting->participants()
+            ->where('users.uuid', $data['to_uuid'])
+            ->wherePivot('status', 'joined')
+            ->first();
+        abort_unless($target && $target->id !== $me->id, 422, 'That participant is not in the meeting.');
+
+        // Mirror mic/cam state onto the pivot so the roster (and anyone who
+        // joins later) shows it, instead of only whoever was online to hear it.
+        if ($data['signal'] === 'media') {
+            $meeting->participants()->updateExistingPivot($me->id, [
+                'mic_on' => (bool) ($data['payload']['mic'] ?? true),
+                'cam_on' => (bool) ($data['payload']['cam'] ?? true),
+            ]);
+        }
+
+        $myPivot = $meeting->participants()->where('users.id', $me->id)->first()?->pivot;
+        \App\Support\Realtime::send(new MeetingSignal($meeting, $me->uuid, $myPivot?->display_name ?? $me->name, $target->uuid, $data['signal'], $data['payload'] ?? []));
+
+        return response()->json(['message' => 'ok']);
+    }
+
+    /** One participant as the room sees them. */
+    protected function rosterEntry(Meeting $meeting, \App\Models\User $user): array
+    {
+        $pivot = $user->pivot;
+
+        // Only host_id makes a host. A row left saying 'host' from before the
+        // meeting changed hands puts a second one in the room, which is what
+        // the tiles were showing. Meeting::roleFor has to say the same.
+        $role = $pivot->role ?? 'participant';
+        if ($meeting->host_id === $user->id) {
+            $role = 'host';
+        } elseif ($role === 'host') {
+            $role = 'cohost';
+        }
+
+        return [
+            'uuid' => $user->uuid,
+            'name' => $pivot->display_name ?? $user->name,
+            // So a tile with the camera off shows a face rather than a letter.
+            'avatar' => $user->profile?->avatar,
+            'role' => $role,
+            'mic_on' => (bool) ($pivot->mic_on ?? true),
+            'cam_on' => (bool) ($pivot->cam_on ?? true),
+            'hand_raised' => (bool) ($pivot->hand_raised ?? false),
+        ];
+    }
+
+    /** Fan a signal out to everyone currently in the room. */
+    protected function tellRoom(Meeting $meeting, \App\Models\User $from, string $fromName, string $signal, array $payload = []): void
+    {
+        foreach ($meeting->inRoom($from->id) as $peer) {
+            \App\Support\Realtime::send(new MeetingSignal($meeting, $from->uuid, $fromName, $peer->uuid, $signal, $payload));
+        }
+    }
+
+    protected function serialize(Meeting $meeting, Request $request): array
+    {
+        $me = $request->user();
+        $myRole = $meeting->roleFor($me);
+        $canModerate = in_array($myRole, ['host', 'cohost'], true);
+
+        return [
+            'uuid' => $meeting->uuid,
+            'code' => $meeting->code,
+            'title' => $meeting->title,
+            'type' => $meeting->type,
+            'is_screen' => $meeting->is_screen,
+            'requires_approval' => $meeting->requires_approval,
+            'is_locked' => $meeting->is_locked,
+            'has_passcode' => (bool) $meeting->passcode,
+            // Derived, not stored: the password is the guest switch.
+            'allows_guests' => $meeting->allowsGuests(),
+            // Only a moderator sees the actual passcode — they are the one
+            // who has to pass it on to invitees.
+            'passcode' => $canModerate ? $meeting->passcode : null,
+            'spotlight_uuid' => $meeting->spotlight_uuid,
+            // Which transport this room is on, so the client knows whether to
+            // build a mesh or ask for an SFU token. Decided by the server so
+            // everybody in one meeting agrees — half a room on each would
+            // simply not see the other half.
+            'transport' => app(LiveKitTokenService::class)->transportFor($meeting),
+            // The host's plan, applied to everyone in the room. Sent to all so
+            // the countdown and the "x of y" count are the same for everybody.
+            'participant_limit' => $meeting->participantLimit(),
+            'minutes_limit' => $meeting->minutesLimit(),
+            'expires_at' => $meeting->expiresAt()?->toIso8601String(),
+            'my_role' => $myRole,
+            'can_moderate' => $canModerate,
+            // 'scheduled' is the column default, so it arrives the instant a
+            // row exists and said nothing about whether a time was ever set.
+            // A meeting with no time was not scheduled — it is just made and
+            // waiting, and the list should say so.
+            'status' => $meeting->wasNeverStarted() ? 'not_started' : $meeting->status,
+            'scheduled_at' => $meeting->scheduled_at?->toIso8601String(),
+            'started_at' => $meeting->started_at?->toIso8601String(),
+            // Tolerates a host that cannot be resolved at all — a deleted
+            // account, say. One unreadable row must not cost the caller their
+            // whole list of meetings.
+            'host' => [
+                'uuid' => $meeting->host?->uuid,
+                'name' => $meeting->host?->name ?? 'Former host',
+                'company' => $meeting->host?->businessPage?->name,
+            ],
+            'is_host' => $meeting->host_id === $request->user()->id,
+            'joined_count' => $meeting->joined_count ?? null,
+            'ended_at' => $meeting->ended_at?->toIso8601String(),
+            'duration_seconds' => $meeting->started_at && $meeting->ended_at
+                ? max(0, (int) $meeting->started_at->diffInSeconds($meeting->ended_at))
+                : null,
+            'participants' => $meeting->relationLoaded('participants')
+                ? $meeting->participants->map(fn ($p) => $p->name . ($p->businessPage?->name ? " ({$p->businessPage->name})" : ''))->unique()->values()
+                : [],
+            'created_at' => $meeting->created_at->toIso8601String(),
+        ];
+    }
+}

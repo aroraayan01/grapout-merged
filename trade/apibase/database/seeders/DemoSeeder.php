@@ -1,0 +1,118 @@
+<?php
+
+namespace Database\Seeders;
+
+use App\Models\Category;
+use App\Models\Role;
+use App\Models\Task;
+use App\Models\User;
+use App\Services\AppIdService;
+use Illuminate\Database\Seeder;
+
+class DemoSeeder extends Seeder
+{
+    public function run(): void
+    {
+        $appIds = app(AppIdService::class);
+        $roles = Role::pluck('id', 'slug');
+
+        static $mobileSeq = 9800000001;
+        $make = function (string $name, string $email, string $role) use ($appIds, $roles, &$mobileSeq): User {
+            $user = User::updateOrCreate(
+                ['email' => $email],
+                [
+                    'name' => $name,
+                    'password' => 'GrapOut@123',
+                    'email_verified_at' => now(),
+                    'status' => 'active',
+                ]
+            );
+            if (! $user->username) {
+                $user->update([
+                    'username' => str_replace(['.', '@'], '', explode('@', $email)[0]),
+                    'mobile' => '+91' . $mobileSeq++,
+                    'country_code' => '+91',
+                    'mobile_verified_at' => now(),
+                ]);
+            }
+            $user->profile()->updateOrCreate([], ['timezone' => 'Asia/Kolkata', 'country' => 'India']);
+            $user->settings()->firstOrCreate([]);
+            if (! $user->appId) {
+                $appIds->generateFor($user);
+            }
+            $user->roles()->sync([$roles[$role]]);
+
+            return $user;
+        };
+
+        $superAdmin = $make('Super Admin', 'superadmin@grapout.test', 'super_admin');
+        // Demo credentials ship publicly in the README — force a change on first login.
+        $superAdmin->update(['force_password_change' => true]);
+        $admin = $make('Demo Admin', 'admin@grapout.test', 'admin');
+        $make('Subadmin One', 'subadmin1@grapout.test', 'subadmin');
+        $make('Subadmin Two', 'subadmin2@grapout.test', 'subadmin');
+
+        $users = collect([
+            $make('Rahul Sharma', 'rahul@grapout.test', 'user'),
+            $make('Priya Patel', 'priya@grapout.test', 'user'),
+            $make('Amit Verma', 'amit@grapout.test', 'user'),
+            $make('Sneha Iyer', 'sneha@grapout.test', 'user'),
+            $make('Vikram Singh', 'vikram@grapout.test', 'user'),
+        ]);
+
+        // Sample tasks for the first demo user
+        $rahul = $users->first();
+        $work = Category::whereNull('user_id')->where('name', 'Work')->first();
+        $family = Category::whereNull('user_id')->where('name', 'Family')->first();
+        $bills = Category::whereNull('user_id')->where('name', 'Bills')->first();
+
+        if ($rahul->tasks()->count() === 0) {
+            $samples = [
+                ['title' => 'Prepare quarterly report', 'category_id' => $work?->id, 'priority' => 'high',
+                    'status' => 'in_progress', 'due_at' => now()->addDays(2), 'progress' => 40, 'is_important' => true],
+                ['title' => 'Buy groceries for the week', 'category_id' => $family?->id, 'priority' => 'normal',
+                    'status' => 'not_started', 'due_at' => now()->addDay()],
+                ['title' => 'Pay electricity bill', 'category_id' => $bills?->id, 'priority' => 'urgent',
+                    'status' => 'not_started', 'due_at' => now()->addDays(3), 'is_important' => true,
+                    'repeat_config' => ['frequency' => 'monthly', 'interval' => 1]],
+                ['title' => 'Doctor appointment follow-up', 'priority' => 'medium',
+                    'status' => 'completed', 'completed_at' => now()->subDay(), 'progress' => 100],
+                ['title' => 'Call parents', 'category_id' => $family?->id, 'priority' => 'normal',
+                    'status' => 'not_started', 'due_at' => now()->subDay()],
+            ];
+
+            foreach ($samples as $sample) {
+                $task = $rahul->tasks()->create($sample);
+                $task->logActivity($rahul, 'created');
+            }
+
+            // A task assigned by the admin to a user
+            $assigned = $admin->tasks()->create([
+                'title' => 'Review onboarding checklist',
+                'category_id' => $work?->id,
+                'priority' => 'high',
+                'status' => 'not_started',
+                'due_at' => now()->addDays(5),
+            ]);
+            $assigned->assignees()->attach($rahul->id, ['assigned_by' => $admin->id]);
+            $assigned->logActivity($admin, 'created');
+
+            // Checklist demo
+            $report = $rahul->tasks()->where('title', 'Prepare quarterly report')->first();
+            foreach (['Collect sales data', 'Draft summary', 'Review with team', 'Send to manager'] as $i => $item) {
+                $report->checklists()->create(['title' => $item, 'is_done' => $i < 1, 'sort_order' => $i]);
+            }
+
+            // Reminder demo
+            $report->reminders()->create([
+                'user_id' => $rahul->id,
+                'remind_at' => now()->addDays(2)->subHour(),
+                'offset_minutes' => 60,
+                'channels' => ['in_app', 'email'],
+            ]);
+        }
+
+        $this->command?->info('Demo users seeded. Password for all: GrapOut@123');
+        $this->command?->warn('Change the Super Admin password after first login!');
+    }
+}

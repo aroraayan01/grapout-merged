@@ -1,0 +1,144 @@
+# Production stack: PostgreSQL + Redis + API + Web.
+# Bring up with:  docker compose -f docker-compose.prod.yml up -d --build
+# (the deploy.sh script does this for you, including generating .env)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aeo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: aeo
+    volumes:
+      - aeo_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U aeo']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - aeo_redisdata:/data
+
+  api:
+    # Pre-built image from GitHub Container Registry (built by CI, NOT on this
+    # server). Override with APP_IMAGE in .env to pin a specific version/tag.
+    image: ${APP_IMAGE:-ghcr.io/himanshu13485-pixel/grapme:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      API_PORT: 4000
+      DATABASE_URL: postgresql://aeo:${POSTGRES_PASSWORD}@postgres:5432/aeo?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QUEUE_ENABLED: 'true'
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      JWT_ACCESS_TTL: 15m
+      JWT_REFRESH_TTL: 7d
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
+      # Public base URL of THIS api service. Also builds the Unipile hosted-auth
+      # notify_url — must be reachable by Unipile or LinkedIn seats stay PENDING.
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL}
+      CORS_ORIGIN: ${WEB_PUBLIC_URL}
+      # Preset super-admin — created automatically on first boot. No signup page.
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      # Public "create workspace" signup stays OFF (login shows only sign-in +
+      # client portal). Flip to "true" temporarily if you ever need it.
+      ALLOW_ADMIN_SIGNUP: ${ALLOW_ADMIN_SIGNUP:-false}
+      # ── LinkedIn channel (Unipile) + AI ── set these in .env for live
+      # connect/send + AI personalization. Blank = features report "not configured".
+      UNIPILE_DSN: ${UNIPILE_DSN:-}
+      UNIPILE_API_KEY: ${UNIPILE_API_KEY:-}
+      UNIPILE_WEBHOOK_SECRET: ${UNIPILE_WEBHOOK_SECRET:-}
+      # On boot, point Unipile's messaging webhook at THIS deployment
+      # (APP_PUBLIC_URL). Without it the URL is whatever was typed into a
+      # dashboard once, which is how it ended up on a dead tunnel while
+      # replies arrived hours late on the sweep. Set to "false" to manage
+      # the webhook by hand. Only ever touches our own webhook.
+      UNIPILE_WEBHOOK_SYNC: ${UNIPILE_WEBHOOK_SYNC:-true}
+      # Optional white-label: your own hosted-auth wizard domain (CNAME → account.unipile.com,
+      # validated by Unipile support). Blank = the client sees Unipile's default domain.
+      UNIPILE_HOSTED_AUTH_DOMAIN: ${UNIPILE_HOSTED_AUTH_DOMAIN:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+      # ── Messaging (self-hosted portal) ── powers number verification (OTP)
+      # and alerts. One project per network, each with its own key. Blank = that
+      # channel is off; in-app + email alerts still work.
+      WA_PORTAL_URL: ${WA_PORTAL_URL:-}
+      WA_PORTAL_API_KEY: ${WA_PORTAL_API_KEY:-}
+      TG_PORTAL_URL: ${TG_PORTAL_URL:-}
+      TG_PORTAL_API_KEY: ${TG_PORTAL_API_KEY:-}
+      # Brand name shown in the OTP message. Deep links reuse WEB_PUBLIC_URL.
+      APP_NAME: ${APP_NAME:-Grapme}
+      # On plan/blog changes, ping the marketing container to refresh its live
+      # pricing + blog pages instantly (internal docker network). Leave the
+      # default unless the marketing site moves off this stack. REVALIDATE_SECRET,
+      # if set, must match the marketing service's value.
+      MARKETING_REVALIDATE_URL: ${MARKETING_REVALIDATE_URL:-http://marketing:3200/api/revalidate}
+      REVALIDATE_SECRET: ${REVALIDATE_SECRET:-}
+      # Inbox that grapme.com "Book a demo" / "Get in touch" submissions are emailed to.
+      LEADS_NOTIFY_EMAIL: ${LEADS_NOTIFY_EMAIL:-harsh@grapmail.com}
+    # Pin a hostname to a specific IP inside the container. Needed when the
+    # WhatsApp portal sits on this same server behind a private address: the
+    # host resolves it via /etc/hosts (which containers never inherit), so the
+    # container would otherwise chase the public IP and time out on the hairpin.
+    # Format "host:ip", e.g. WA_PORTAL_HOST_ENTRY=wa.example.com:10.131.0.5.
+    # The default is a reserved .invalid name, i.e. a harmless no-op.
+    extra_hosts:
+      - '${WA_PORTAL_HOST_ENTRY:-portal.invalid:127.0.0.1}'
+    # Apply DB migrations on boot, then start the API.
+    command: >
+      sh -c "npx prisma migrate deploy --schema=/app/apps/api/prisma/schema.prisma &&
+             node apps/api/dist/src/main.js"
+    # BIND_HOST=127.0.0.1 (in .env) exposes it only to a local reverse proxy
+    # (cPanel/nginx). Default 0.0.0.0 = reachable directly on the server IP.
+    ports:
+      - '${BIND_HOST:-0.0.0.0}:4000:4000'
+
+  web:
+    image: ${APP_IMAGE:-ghcr.io/himanshu13485-pixel/grapme:latest}
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      # Internal API URL for server-side image proxying (/media/assets/*).
+      API_URL: ${WEB_API_URL:-http://api:4000/api/v1}
+    command: sh -c "npm run start --workspace apps/web"
+    ports:
+      - '${BIND_HOST:-0.0.0.0}:3000:3000'
+
+  # Marketing site (grapme.com) — public landing + live pricing/blog. Reaches the
+  # API over the internal docker network (API_URL), which is required for the live
+  # plan/blog fetches, the like proxy, and same-origin blog image serving.
+  marketing:
+    image: ${APP_IMAGE:-ghcr.io/himanshu13485-pixel/grapme:latest}
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      NODE_ENV: production
+      API_URL: ${MARKETING_API_URL:-http://api:4000/api/v1}
+      NEXT_PUBLIC_SITE_URL: ${MARKETING_SITE_URL:-https://www.grapme.com}
+      # Must match the API's REVALIDATE_SECRET to accept on-demand refresh calls.
+      REVALIDATE_SECRET: ${REVALIDATE_SECRET:-}
+    command: sh -c "npm run start --workspace apps/marketing"
+    ports:
+      - '${BIND_HOST:-0.0.0.0}:3200:3200'
+
+volumes:
+  aeo_pgdata:
+  aeo_redisdata:

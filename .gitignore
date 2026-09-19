@@ -1,0 +1,39 @@
+# Default deny, then allow back the three parts that are the merge work.
+#
+# The other direction — listing what to exclude — is how secrets get committed.
+# The legacy grapout.com dump that sits beside these folders keeps its
+# production credentials in ordinary source files, copied across more of them
+# than anyone can audit by reading, and a git history cannot be edited
+# afterwards. So nothing is tracked unless it is named here.
+/*
+!/.gitignore
+!/README.md
+!/crm/
+!/trade/
+!/_run/
+
+# ── Things that can be reinstalled ─────────────────────────────────────────
+node_modules/
+vendor/
+.next/
+crm/apps/api/dist/
+
+# ── Live data. Not ours to publish. ────────────────────────────────────────
+# A copy of the CRM's database: real clients, real contacts, real messages.
+.pgdata/
+trade/apibase/storage/framework/
+trade/apibase/storage/logs/
+trade/apibase/storage/app/public/
+_run/logs/
+
+# ── Secrets ────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# ── Noise ──────────────────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store
+*.log

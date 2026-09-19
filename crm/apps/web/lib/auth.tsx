@@ -1,0 +1,156 @@
+'use client';
+
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  ReactNode,
+} from 'react';
+import { api, appUrl, setToken, setRefreshToken, clearTokens } from './api';
+
+export interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+  role: 'SUPER_ADMIN' | 'SUB_ADMIN' | 'USER' | 'CLIENT' | 'SALES';
+  tenantId: string;
+  fullAccess?: boolean;
+  accessModules?: string[];
+  canDelete?: boolean;
+  canEdit?: boolean;
+  profileLimit?: number;
+  companyName?: string | null;
+  contactMobile?: string | null;
+}
+
+interface LoginResponse {
+  user: AuthUser;
+  accessToken: string;
+  refreshToken: string;
+}
+
+interface AuthContextValue {
+  user: AuthUser | null;
+  loading: boolean;
+  login: (email: string, password: string) => Promise<void>;
+  register: (
+    name: string,
+    email: string,
+    password: string,
+    tenantName?: string,
+  ) => Promise<void>;
+  logout: () => void;
+  refreshUser: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextValue | null>(null);
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api
+      .get<AuthUser>('/auth/me')
+      .then(setUser)
+      .catch(() => setUser(null))
+      .finally(() => setLoading(false));
+  }, []);
+
+  // After auth, pull the full profile (/auth/me) so the session user carries
+  // fullAccess + accessModules — the login response omits them.
+  async function hydrateUser(fallback: AuthUser) {
+    try {
+      setUser(await api.get<AuthUser>('/auth/me'));
+    } catch {
+      setUser(fallback);
+    }
+  }
+
+  async function login(email: string, password: string) {
+    const res = await api.post<LoginResponse>('/auth/login', {
+      email,
+      password,
+    });
+    setToken(res.accessToken);
+    setRefreshToken(res.refreshToken);
+    await hydrateUser(res.user);
+  }
+
+  async function register(
+    name: string,
+    email: string,
+    password: string,
+    tenantName?: string,
+  ) {
+    const res = await api.post<LoginResponse>('/auth/register', {
+      name,
+      email,
+      password,
+      tenantName,
+    });
+    setToken(res.accessToken);
+    setRefreshToken(res.refreshToken);
+    await hydrateUser(res.user);
+  }
+
+  function logout() {
+    const wasClient = user?.role === 'CLIENT';
+    clearTokens();
+    // Clients return to their own sign-in door; admins go to the login page.
+    // This used to send clients to the marketing site, which now means walking
+    // them off the domain the app is served from — their way back in is here.
+    if (wasClient && typeof window !== 'undefined') {
+      window.location.href = appUrl('/client');
+      return;
+    }
+    setUser(null);
+  }
+
+  async function refreshUser() {
+    try {
+      setUser(await api.get<AuthUser>('/auth/me'));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return (
+    <AuthContext.Provider
+      value={{ user, loading, login, register, logout, refreshUser }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuth must be used within AuthProvider');
+  return ctx;
+}
+
+/** Whether the signed-in user may use delete actions. Super admins always can;
+ *  sub-admins ONLY when explicitly granted the delete right — "Full access"
+ *  (which controls section visibility) does not by itself allow deleting. */
+export function useCanDelete(): boolean {
+  const { user } = useAuth();
+  if (!user) return false;
+  if (user.role === 'SUPER_ADMIN') return true;
+  if (user.role === 'SUB_ADMIN') return !!user.canDelete;
+  if (user.role === 'CLIENT') return false; // deletes go through admin
+  if (user.role === 'SALES') return false; // salespeople never delete
+  return true;
+}
+
+/** Whether the signed-in user may use edit actions. Super admins always can;
+ *  sub-admins only if granted (full access or the canEdit flag). */
+export function useCanEdit(): boolean {
+  const { user } = useAuth();
+  if (!user) return false;
+  if (user.role === 'SUPER_ADMIN') return true;
+  if (user.role === 'SUB_ADMIN') return !!(user.fullAccess || user.canEdit);
+  if (user.role === 'CLIENT') return true; // clients edit their own resources
+  return true;
+}

@@ -1,0 +1,1 @@
+import{It as e,Pr as t,l as n}from"./index-Bx5WKudo.js";function r(){let{data:r}=t({queryKey:[`trade`,`config`],queryFn:n.config,staleTime:60*6e4});return{categories:r?.categories??[],kinds:r?.kinds??[],currencies:r?.currencies?.length?r.currencies:[...e],translate:r?.translate??!1,languages:r?.languages??{}}}export{r as t};

@@ -1,0 +1,1985 @@
+// Automated Email Outreach — Prisma schema
+// Multi-tenant: every business table carries tenantId for row-level isolation.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────── Enums ───────────────────────────────
+
+enum Role {
+  SUPER_ADMIN
+  SUB_ADMIN
+  USER
+  CLIENT
+  SALES
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  INVITED
+}
+
+enum MailProtocol {
+  SMTP
+  IMAP
+  POP
+}
+
+enum MailboxStatus {
+  PENDING
+  ACTIVE
+  DISABLED
+}
+
+enum ContactStatus {
+  ACTIVE
+  UNSUBSCRIBED
+  BOUNCED
+}
+
+enum ImportStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PROCESSING
+  DONE
+  FAILED
+}
+
+/// Review state of an email template. Templates written in the client portal
+/// start PENDING and only become sendable once an admin/sub-admin approves them.
+/// Staff-authored templates are created APPROVED.
+enum TemplateStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum CampaignStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  SCHEDULED
+  RUNNING
+  PAUSED
+  COMPLETED
+  REJECTED
+}
+
+enum StepCondition {
+  ALWAYS
+  NO_REPLY
+  OPENED
+  NOT_OPENED
+}
+
+enum ScheduleStatus {
+  PENDING
+  APPROVED
+  QUEUED
+  SENT
+}
+
+enum MessageDirection {
+  OUTBOUND
+  INBOUND
+}
+
+enum MessageStatus {
+  DRAFT
+  QUEUED
+  SENT
+  DELIVERED
+  FAILED
+  BOUNCED
+}
+
+enum EventType {
+  SENT
+  DELIVERED
+  OPEN
+  CLICK
+  REPLY
+  BOUNCE
+  UNSUBSCRIBE
+  COMPLAINT
+}
+
+enum ApprovalEntity {
+  CAMPAIGN
+  SCHEDULE
+  SEQUENCE
+  IMPORT
+  SMTP
+  MESSAGE_DELETE
+  CLIENT_DELETE
+  CLIENT_ACTIVATION
+  LI_CAMPAIGN
+  LI_CHANNEL_REQUEST
+  CLIENT_LOGIN_EMAIL // admin changed a client's login email; awaiting confirm/approval
+  TEMPLATE // client-portal template (new, or its content edited) awaiting review
+  COHORT // client-portal cohort (Upload & enroll / Create next now) awaiting review
+  CLIENT_CHANGE // client-portal change request: sequence, settings, cohort stop/delete
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum SuppressionReason {
+  UNSUBSCRIBE
+  BOUNCE
+  MANUAL
+  COMPLAINT
+}
+
+enum EnrollmentStatus {
+  ACTIVE
+  REPLIED
+  STOPPED
+  COMPLETED
+}
+
+enum CohortStatus {
+  PENDING // created in the client portal; nothing sends until an admin approves it
+  RUNNING
+  PAUSED
+  STOPPED
+  COMPLETED
+}
+
+// ───────────────────────── Tenancy & Identity ─────────────────────────
+
+model Tenant {
+  id               String   @id @default(uuid())
+  name             String
+  plan             String   @default("free")
+  status           String   @default("active")
+  settings         Json     @default("{}")
+  greetingsEnabled Boolean  @default(true) // show a daily login greeting to clients
+  setupRemindersEnabled Boolean @default(true) // daily email/WhatsApp nudges to setup-step owners
+  reportMailboxId  String? // explicit mailbox client reports are sent from (else auto-resolved)
+  // AI template assistant (OpenAI). Key is encrypted at rest; only the super admin
+  // sets it (My Account) and it's shared tenant-wide by admins/sub-admins.
+  aiApiKey         String? // encrypted OpenAI API key (null = not configured)
+  aiModel          String? // OpenAI model id (null = code default, e.g. gpt-5.6-luna)
+  paymentMode      String   @default("MANUAL") // AUTO (Cashfree self-serve) | MANUAL (offline via request)
+  // Bounce circuit breaker: auto-disable a mailbox whose recent bounce rate exceeds this
+  // percentage. Most providers start throttling a sender somewhere around 5–10%.
+  bounceMaxRatePct Int      @default(7)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  users             User[]
+  emailAccounts     EmailAccount[]
+  contactLists      ContactList[]
+  contacts          Contact[]
+  suppressionList   Suppression[]
+  importJobs        ImportJob[]
+  templates         EmailTemplate[]
+  campaigns         Campaign[]
+  messages          EmailMessage[]
+  approvals         Approval[]
+  activityLogs      ActivityLog[]
+  creditAccounts    CreditAccount[]
+  clients           Client[]
+  cohorts           Cohort[]
+  enrollments       Enrollment[]
+  plans             Plan[]
+  greetings         Greeting[]
+  assets            Asset[]
+  blogPosts         BlogPost[]
+  liAudiencePresets LiAudiencePreset[]
+  supportTickets    SupportTicket[]
+  broadcasts        Broadcast[]
+  internalNotes     InternalNote[]
+  duplicateEmails   DuplicateEmail[]
+}
+
+// Uploaded images (e.g. for email templates), served publicly by id so mail
+// clients can load them. Stored in the DB so they persist without a file volume.
+model Asset {
+  id        String   @id @default(uuid())
+  tenantId  String
+  filename  String
+  mimeType  String
+  data      Bytes
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
+
+/// Reusable Target-Audience templates for LinkedIn campaigns, scoped to a single
+/// client workspace (shared across that client's campaigns, not other clients').
+model LiAudiencePreset {
+  id        String   @id @default(uuid())
+  tenantId  String
+  clientId  String
+  name      String
+  spec      Json // the audience spec (countries, industries, jobTitles, keywords, …)
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+}
+
+/// Marketing blog posts, authored in the admin and surfaced on grapme.com/blog.
+model BlogPost {
+  id          String    @id @default(uuid())
+  tenantId    String
+  slug        String // URL slug (unique per tenant)
+  title       String
+  excerpt     String? // short summary for the list card + meta description
+  contentHtml String // sanitized HTML body (images are Asset URLs, not inlined)
+  coverImage  String? // Asset URL (or external) for the hero image
+  authorName  String? // publisher / author display name
+  status      String    @default("draft") // "draft" | "published"
+  publishedAt DateTime? // when it went live (drives the public date + ordering)
+  likes       Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, slug])
+  @@index([tenantId, status])
+}
+
+// Admin-authored "Happy Business" messages shown in the daily client greeting.
+model Greeting {
+  id        String   @id @default(uuid())
+  tenantId  String
+  message   String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
+
+// A client's request to move onto a plan. AUTO requests are paid via Cashfree
+// then auto-activated; MANUAL requests are activated by an admin after offline payment.
+model PlanUpgradeRequest {
+  id            String   @id @default(uuid())
+  tenantId      String
+  clientId      String
+  requestedPlan String
+  currency      String?
+  period        String   @default("monthly") // monthly | yearly
+  amount        Int      @default(0) // in the currency's minor-less unit (whole)
+  mode          String   @default("MANUAL") // AUTO | MANUAL
+  status        String   @default("PENDING") // PENDING | PAID | ACTIVATED | REJECTED
+  paymentRef    String? // Cashfree order/payment id
+  note          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([tenantId, status])
+  @@index([clientId])
+}
+
+// One subscription period per client — the renewal history log. The client's live
+// window still lives on Client (validityDays/validityStartAt); the latest period
+// mirrors it. Replacing a plan/validity early closes the open period (endedReason).
+model SubscriptionPeriod {
+  id           String   @id @default(uuid())
+  tenantId     String
+  clientId     String
+  plan         String
+  validityDays Int
+  startAt      DateTime @default(now())
+  endAt        DateTime
+  amount       Int? // price paid (whole currency units), if known
+  currency     String?
+  invoiceNo    String? // client's invoice number(s) at activation (snapshot, comma-separated)
+  invoiceDate  DateTime? // invoice date at activation (snapshot)
+  // Who entered this period (renewals are submitted by a staff user).
+  recordedById   String?
+  recordedByName String?
+  source       String   @default("admin") // admin | billing | plan_request | registration | backfill
+  endedReason  String? // null = ran to natural expiry; SUPERSEDED = replaced early; CANCELLED
+  // Snapshot of what the plan included at activation: { emailCredits, linkedInCredits,
+  // mailboxLimit, seatLimit, emailCampaignLimit, linkedInCampaignLimit }.
+  entitlements Json?
+  createdAt    DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([clientId, startAt])
+  @@index([endAt])
+}
+
+// Tenant-defined plan names shown in every plan picker/filter.
+model Plan {
+  id                    String   @id @default(uuid())
+  tenantId              String
+  name                  String
+  color                 String   @default("#0f766e") // theme color for the client portal
+  sortOrder             Int      @default(0) // serial / display order
+  // Which channels this plan provides.
+  emailEnabled          Boolean  @default(true)
+  linkedInEnabled       Boolean  @default(true)
+  // Membership entitlements (reference values shown/applied per plan).
+  validityDays          Int? // plan validity window in days
+  emailCredits          Int      @default(0) // credits for the Email channel
+  linkedInCredits       Int      @default(0) // credits for the LinkedIn channel
+  mailboxLimit          Int      @default(0) // No. of mailboxes (Email)
+  seatLimit             Int      @default(0) // No. of seats (LinkedIn)
+  emailCampaignLimit    Int      @default(0) // No. of campaigns (Email)
+  linkedInCampaignLimit Int      @default(0) // No. of campaigns (LinkedIn)
+  // Multi-currency pricing. Shape:
+  // [{ currency, monthlyPrice, monthlyBest, yearlyPrice, yearlyBest }]
+  pricing               Json?
+  // Optional YEARLY entitlement overrides (the columns above are the MONTHLY set).
+  // Shape: { emailCredits, linkedInCredits, mailboxLimit, seatLimit,
+  //          emailCampaignLimit, linkedInCampaignLimit, validityDays }
+  yearlyEntitlements    Json?
+  // Pricing-card style on the public + in-app pricing pages:
+  //  "entitlements" (default) = credits / mailboxes / seats / campaigns breakdown
+  //  "features"               = simple price + best price + a free-text feature list
+  cardStyle             String   @default("entitlements")
+  features              Json? // feature bullet list (string[]) for the "features" card
+  popular               Boolean  @default(false) // highlight this plan as "Most popular"
+  createdAt             DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+}
+
+model User {
+  id                    String     @id @default(uuid())
+  tenantId              String
+  name                  String
+  email                 String     @unique
+  passwordHash          String
+  role                  Role       @default(USER)
+  status                UserStatus @default(ACTIVE)
+  fullAccess            Boolean    @default(false) // sub-admin: access to everything
+  accessModules         Json       @default("[]") // sub-admin: allowed module keys
+  canDelete             Boolean    @default(false) // sub-admin: allowed to use delete actions
+  canEdit               Boolean    @default(true) // sub-admin: allowed to use edit actions
+  profileLimit          Int        @default(1) // client-portal: how many profiles they may self-create (billable)
+  companyName           String? // client self-registration: their company (prefills New Client form)
+  contactMobile         String? // client self-registration: contact phone (prefills New Client form). Also the salesperson "office mobile" and the WhatsApp number for alerts.
+  // Per-user communication preferences for *alert* notifications (in-app is always on).
+  // Transactional mail (verification, reset, welcome) ignores these and always sends.
+  notifyEmail           Boolean    @default(true)
+  notifyWhatsapp        Boolean    @default(false)
+  notifyTelegram        Boolean    @default(false)
+  // Set once the user proves they control the number on that network (OTP).
+  // Alerts are only ever sent to a verified number, per channel — proving a
+  // number on WhatsApp says nothing about whether it reaches them on Telegram.
+  whatsappVerifiedAt    DateTime?
+  telegramVerifiedAt    DateTime?
+  // Netvork is our own network, so a user is an account on it rather than a
+  // number on someone else's. Addressed by App ID (or username/email, which
+  // Netvork resolves to the same person), which is why it needs its own field
+  // instead of reusing contactMobile like the two phone channels do.
+  netvorkAppId          String?
+  notifyNetvork         Boolean    @default(false)
+  netvorkVerifiedAt     DateTime?
+  emailVerified         Boolean    @default(true) // client self-registration must confirm email before login
+  verifyTokenHash       String? // sha256 of the email-confirmation token
+  verifyExpires         DateTime? // confirmation-link expiry
+  // Admin-initiated login-email change, held until the client confirms via the emailed
+  // link OR an admin approves it in the queue. Current email keeps working until then.
+  pendingEmail          String?
+  pendingEmailTokenHash String? // sha256 of the change-confirmation token
+  pendingEmailExpires   DateTime?
+  timezone              String     @default("UTC")
+  twoFactorSecret       String?
+  avatarUrl             String?
+  lastLoginAt           DateTime?
+  // Force-logout cutoff: any access token issued (iat) before this is rejected,
+  // so an admin "log out" takes effect immediately, not just after token expiry.
+  sessionsRevokedAt     DateTime?
+  createdAt             DateTime   @default(now())
+  updatedAt             DateTime   @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  permissions        UserPermission[]
+  emailAccounts      EmailAccount[]
+  contactLists       ContactList[]
+  contacts           Contact[]
+  importJobs         ImportJob[]
+  templates          EmailTemplate[]
+  campaigns          Campaign[]
+  ownedClients       Client[]         @relation("ClientOwner")
+  creditAccount      CreditAccount?
+  notifications      Notification[]
+  refreshTokens      RefreshToken[]
+  passwordResets     PasswordReset[]
+  submittedApprovals Approval[]       @relation("ApprovalSubmitter")
+  reviewedApprovals  Approval[]       @relation("ApprovalReviewer")
+  activityLogs       ActivityLog[]
+
+  // Sub-admin assignments
+  assignmentsAsSubAdmin SubAdminAssignment[] @relation("SubAdmin")
+  assignmentsAsUser     SubAdminAssignment[] @relation("AssignedUser")
+
+  // Sales: clients this salesperson is responsible for.
+  salesClients     Client[]         @relation("SalesPerson")
+  // Client Support relations.
+  raisedTickets    SupportTicket[]  @relation("TicketOwner")
+  assignedTickets  SupportTicket[]  @relation("TicketAssignee")
+  escalatedTickets SupportTicket[]  @relation("TicketEscalator")
+  supportMessages  SupportMessage[]
+
+  // Admin broadcasts delivered to this (client) user.
+  broadcastReceipts    BroadcastRecipient[]
+  // Internal Work notes shared with this admin / sub-admin.
+  internalNoteReceipts InternalNoteRecipient[]
+  // Pending number-verification codes, for either messaging channel.
+  channelVerifications  ChannelVerification[]
+
+  @@index([tenantId])
+  @@index([role])
+}
+
+/// A one-time code sent to a user on WhatsApp or Telegram to prove the number
+/// is theirs. Only the hash is stored — the plain code exists solely in the
+/// message we send. Codes are per channel: proving a number on one network
+/// says nothing about whether it reaches the same person on the other.
+model ChannelVerification {
+  id        String   @id @default(uuid())
+  userId    String
+  /// whatsapp | telegram | netvork
+  channel   String   @default("whatsapp")
+  /// The address the code went to — a phone number on the two phone channels,
+  /// an App ID on Netvork — so changing it invalidates the pending code. The
+  /// column is still called `phone`: it predates there being anything else.
+  address   String   @map("phone")
+  codeHash  String
+  expiresAt DateTime
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, channel])
+  @@index([userId, expiresAt])
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String
+  expiresAt DateTime
+  revokedAt DateTime?
+  ip        String? // client IP at login/refresh (carried across rotations)
+  userAgent String?
+  createdAt DateTime  @default(now()) // also the last-activity time (refresh rotates)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, revokedAt])
+}
+
+model PasswordReset {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Permission {
+  id          String           @id @default(uuid())
+  key         String           @unique
+  description String
+  users       UserPermission[]
+}
+
+model UserPermission {
+  id           String  @id @default(uuid())
+  userId       String
+  permissionId String
+  granted      Boolean @default(true)
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, permissionId])
+}
+
+model SubAdminAssignment {
+  id                 String   @id @default(uuid())
+  subAdminId         String
+  assignedUserId     String?
+  assignedCampaignId String?
+  assignedClientId   String?
+  createdAt          DateTime @default(now())
+
+  subAdmin     User      @relation("SubAdmin", fields: [subAdminId], references: [id], onDelete: Cascade)
+  assignedUser User?     @relation("AssignedUser", fields: [assignedUserId], references: [id], onDelete: Cascade)
+  campaign     Campaign? @relation(fields: [assignedCampaignId], references: [id], onDelete: Cascade)
+  client       Client?   @relation(fields: [assignedClientId], references: [id], onDelete: Cascade)
+
+  @@index([subAdminId])
+}
+
+// ───────────────────────── Mailboxes ─────────────────────────
+
+model EmailAccount {
+  id                       String        @id @default(uuid())
+  tenantId                 String
+  userId                   String
+  label                    String
+  protocol                 MailProtocol  @default(SMTP)
+  smtpHost                 String?
+  smtpPort                 Int?
+  smtpSecure               Boolean       @default(true) // legacy; smtpEncryption is the source of truth
+  smtpEncryption           String        @default("SSL") // "SSL" (implicit TLS) | "STARTTLS" | "NONE"
+  imapHost                 String?
+  imapPort                 Int?
+  imapEncryption           String        @default("SSL") // "SSL" | "STARTTLS" | "NONE"
+  emailAddress             String
+  smtpUsername             String? // SMTP login when it differs from the From address (e.g. AWS SES AKIA… user)
+  credentialsEncrypted     String // AES-256-GCM blob (SMTP password), never returned to client
+  imapUsername             String? // IMAP login when receiving lives on a different host than SMTP
+  imapCredentialsEncrypted String? // AES-256-GCM blob (IMAP password); falls back to SMTP creds when null
+  imapAllowSelfSigned      Boolean       @default(false) // accept self-signed / private-CA IMAP TLS certs
+  status                   MailboxStatus @default(PENDING)
+  statusReason             String? // why it's in this state (e.g. bounce circuit breaker)
+  // Bounce circuit breaker: only sends from this point on are judged. Stamped when a
+  // mailbox is (re-)enabled, so a deliberate re-enable gets a clean slate instead of
+  // being knocked out again by the very bounces that just got dealt with.
+  bounceWindowFrom         DateTime?
+  dailyLimit               Int           @default(200)
+  warmupEnabled            Boolean       @default(true)
+  sendSpeedSeconds         Int           @default(90)
+  reputationScore          Int           @default(100)
+  clientId                 String? // mailbox group: all mailboxes of a client form its sending pool
+  rotationOrder            Int           @default(0)
+  createdAt                DateTime      @default(now())
+  updatedAt                DateTime      @updatedAt
+
+  tenant    Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client    Client?        @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  campaigns Campaign[]
+  messages  EmailMessage[]
+
+  @@index([tenantId])
+  @@index([userId])
+  @@index([clientId])
+}
+
+// ───────────────────────── Contacts ─────────────────────────
+
+model ContactList {
+  id          String   @id @default(uuid())
+  tenantId    String
+  userId      String
+  name        String
+  description String?
+  clientId    String? // owning client (null = shared/global)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant    Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client    Client?             @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  members   ContactListMember[]
+  campaigns Campaign[]
+
+  @@index([tenantId])
+  @@index([clientId])
+}
+
+model Contact {
+  id           String        @id @default(uuid())
+  tenantId     String
+  userId       String
+  email        String
+  firstName    String?
+  lastName     String?
+  company      String?
+  country      String?
+  clientId     String? // owning client (null = shared/global)
+  customFields Json          @default("{}")
+  status       ContactStatus @default(ACTIVE)
+  dedupeHash   String
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  tenant      Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user        User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client      Client?             @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  lists       ContactListMember[]
+  messages    EmailMessage[]
+  enrollments Enrollment[]
+
+  @@unique([tenantId, dedupeHash])
+  @@index([tenantId])
+  @@index([email])
+  @@index([clientId])
+}
+
+model ContactListMember {
+  id        String @id @default(uuid())
+  listId    String
+  contactId String
+
+  list    ContactList @relation(fields: [listId], references: [id], onDelete: Cascade)
+  contact Contact     @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([listId, contactId])
+}
+
+model Suppression {
+  id        String            @id @default(uuid())
+  tenantId  String
+  email     String
+  reason    SuppressionReason
+  createdAt DateTime          @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+}
+
+model ImportJob {
+  id         String       @id @default(uuid())
+  tenantId   String
+  userId     String
+  filename   String
+  listId     String? // optional target list applied on approval
+  clientId   String? // owning client, propagated to imported contacts
+  totalRows  Int          @default(0)
+  validRows  Int          @default(0)
+  dupRows    Int          @default(0)
+  payload    Json         @default("[]") // staged rows; inserted on approval
+  status     ImportStatus @default(PENDING)
+  approvalId String?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
+
+// Audit of emails that were already in the tenant when a new list was imported:
+// e.g. importing List-2 (80 rows) where 10 already existed in List-1. Records the
+// incoming file/list/company and where the address already lived, for a
+// downloadable "Duplicate Email" report.
+model DuplicateEmail {
+  id                String   @id @default(uuid())
+  tenantId          String
+  email             String
+  fileName          String? // the import file the duplicate arrived on
+  importJobId       String?
+  newListId         String? // the list being uploaded into (List-2)
+  newListName       String?
+  newCompany        String? // company on the incoming row
+  existingListNames String? // comma-joined lists the address already belonged to (List-1)
+  existingCompany   String? // company already on file for the address
+  existingClientId  String?
+  createdAt         DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([tenantId, createdAt])
+}
+
+// ───────────────────────── Templates & Campaigns ─────────────────────────
+
+model EmailTemplate {
+  id        String   @id @default(uuid())
+  tenantId  String
+  userId    String
+  name      String
+  subject   String
+  bodyHtml  String
+  bodyText  String?
+  variables Json     @default("[]")
+  clientId  String? // owning client (null = shared/global)
+  /// Only APPROVED templates are ever sent (cohort engine and campaign sender).
+  status     TemplateStatus @default(APPROVED)
+  /// Reviewer's reason when a template is rejected, shown back to the client.
+  reviewNote String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client        Client?        @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  campaigns     Campaign[]
+  steps         CampaignStep[]
+  sequenceSteps SequenceStep[]
+
+  @@index([tenantId])
+  @@index([clientId])
+}
+
+model Campaign {
+  id               String         @id @default(uuid())
+  tenantId         String
+  userId           String
+  name             String
+  clientLabel      String?
+  clientId         String?
+  emailAccountId   String?
+  listId           String?
+  templateId       String?
+  status           CampaignStatus @default(DRAFT)
+  timezone         String         @default("UTC")
+  dailyLimit       Int            @default(200)
+  sendSpeedSeconds Int            @default(90)
+  startAt          DateTime?
+  approvalId       String?
+  creditsEstimate  Int            @default(0)
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  tenant       Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user         User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client       Client?        @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  emailAccount EmailAccount?  @relation(fields: [emailAccountId], references: [id])
+  list         ContactList?   @relation(fields: [listId], references: [id])
+  template     EmailTemplate? @relation(fields: [templateId], references: [id])
+
+  steps       CampaignStep[]
+  schedules   Schedule[]
+  messages    EmailMessage[]
+  events      EmailEvent[]
+  assignments SubAdminAssignment[]
+
+  @@index([tenantId])
+  @@index([userId])
+  @@index([status])
+  @@index([clientId])
+}
+
+model CampaignStep {
+  id         String        @id @default(uuid())
+  campaignId String
+  stepOrder  Int
+  templateId String?
+  waitDays   Int           @default(0)
+  condition  StepCondition @default(ALWAYS)
+
+  campaign Campaign       @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  template EmailTemplate? @relation(fields: [templateId], references: [id])
+  messages EmailMessage[]
+
+  @@unique([campaignId, stepOrder])
+}
+
+model Schedule {
+  id          String         @id @default(uuid())
+  campaignId  String
+  scheduledAt DateTime
+  timezone    String         @default("UTC")
+  status      ScheduleStatus @default(PENDING)
+  approvalId  String?
+  createdAt   DateTime       @default(now())
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId])
+}
+
+// ───────────────────────── Sending & Events ─────────────────────────
+
+model EmailMessage {
+  id             String           @id @default(uuid())
+  tenantId       String
+  campaignId     String?
+  cohortId       String? // GRAPOUT cohort this outbound belongs to (for cohort reports)
+  stepId         String?
+  contactId      String?
+  emailAccountId String?
+  direction      MessageDirection @default(OUTBOUND)
+  messageId      String? // RFC Message-ID
+  inReplyTo      String?
+  fromAddress    String? // sender address for INBOUND mail
+  subject        String?
+  body           String?
+  status         MessageStatus    @default(QUEUED)
+  sentAt         DateTime?
+  error          String?
+  readAt         DateTime? // when an INBOUND reply was marked read (null = unread)
+  // INBOUND only: REPLY (a person answered), AUTO_REPLY (out-of-office and friends —
+  // recorded but never treated as a reply), BOUNCE. Null on rows stored before this.
+  inboundKind    String?
+  createdAt      DateTime         @default(now())
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaign     Campaign?     @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  step         CampaignStep? @relation(fields: [stepId], references: [id])
+  contact      Contact?      @relation(fields: [contactId], references: [id])
+  emailAccount EmailAccount? @relation(fields: [emailAccountId], references: [id])
+  events       EmailEvent[]
+
+  @@index([tenantId])
+  @@index([campaignId])
+  @@index([cohortId])
+  @@index([status])
+}
+
+model EmailEvent {
+  id         String    @id @default(uuid())
+  messageId  String
+  campaignId String?
+  eventType  EventType
+  meta       Json      @default("{}")
+  occurredAt DateTime  @default(now())
+
+  message  EmailMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  campaign Campaign?    @relation(fields: [campaignId], references: [id])
+
+  @@index([campaignId])
+  @@index([eventType])
+}
+
+// ───────────────────────── Governance ─────────────────────────
+
+model Approval {
+  id             String         @id @default(uuid())
+  tenantId       String
+  entityType     ApprovalEntity
+  entityId       String
+  submittedById  String
+  status         ApprovalStatus @default(PENDING)
+  reviewerId     String?
+  decisionReason String?
+  decidedAt      DateTime?
+  createdAt      DateTime       @default(now())
+
+  tenant      Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  submittedBy User   @relation("ApprovalSubmitter", fields: [submittedById], references: [id])
+  reviewer    User?  @relation("ApprovalReviewer", fields: [reviewerId], references: [id])
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([entityType, entityId])
+}
+
+model ActivityLog {
+  id         String   @id @default(uuid())
+  tenantId   String
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ipAddress  String?
+  occurredAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  actor  User?  @relation(fields: [actorId], references: [id])
+
+  @@index([tenantId])
+  @@index([entityType, entityId])
+}
+
+// ───────────────────────── Credits & Notifications ─────────────────────────
+
+model CreditAccount {
+  id            String   @id @default(uuid())
+  tenantId      String
+  userId        String   @unique
+  balance       Int      @default(0)
+  pricePerEmail Float    @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  tenant       Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions CreditTransaction[]
+
+  @@index([tenantId])
+}
+
+model CreditTransaction {
+  id              String   @id @default(uuid())
+  creditAccountId String
+  delta           Int
+  reason          String
+  referenceId     String?
+  createdAt       DateTime @default(now())
+
+  creditAccount CreditAccount @relation(fields: [creditAccountId], references: [id], onDelete: Cascade)
+
+  @@index([creditAccountId])
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  type      String
+  title     String
+  body      String?
+  link      String? // in-app deep link, e.g. /updates?thread=<id>
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+}
+
+// ───────────────── Work / Meetings / Notification board ─────────────────
+// A two-way threaded update between the agency (admin/sub-admin) and a client.
+// Each thread is a Work / Meeting / Notification item with a rich-text body and
+// a list of plain-text replies. Per-item toggles fan out an email (and a
+// WhatsApp stub) copy, and a bell Notification row to the counterparties.
+enum UpdateType {
+  WORK
+  MEETING
+  NOTIFICATION
+}
+
+model UpdateThread {
+  id              String     @id @default(uuid())
+  tenantId        String
+  clientId        String // the client workspace this update belongs to
+  type            UpdateType @default(WORK)
+  title           String
+  bodyHtml        String // rich-text body of the opening comment
+  authorUserId    String
+  authorRole      Role
+  authorName      String // denormalized for display
+  notifyEmail     Boolean    @default(false)
+  notifyWhatsapp  Boolean    @default(false)
+  attachmentData  Bytes? // private blob (nullable); served only through the gated download route
+  attachmentName  String?
+  attachmentMime  String?
+  lastActivityAt  DateTime   @default(now()) // opening post or latest reply
+  lastActorUserId String? // who caused the latest activity (for unread math)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  replies UpdateReply[]
+  reads   UpdateThreadRead[]
+
+  @@index([tenantId, type])
+  @@index([clientId])
+  @@index([lastActivityAt])
+}
+
+// Per-user monotonic "last seen" for an update thread — powers the "seen by"
+// read receipts shown under each message (transparency for who has read).
+model UpdateThreadRead {
+  id       String   @id @default(uuid())
+  threadId String
+  userId   String
+  userName String? // denormalized for display
+  userRole Role
+  seenAt   DateTime @default(now())
+
+  thread UpdateThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@unique([threadId, userId])
+  @@index([threadId])
+}
+
+model UpdateReply {
+  id             String       @id @default(uuid())
+  threadId       String
+  thread         UpdateThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  body           String // plain-text reply
+  authorUserId   String
+  authorRole     Role
+  authorName     String
+  attachmentData Bytes? // private blob (nullable); served only through the gated download route
+  attachmentName String?
+  attachmentMime String?
+  createdAt      DateTime     @default(now())
+
+  @@index([threadId])
+}
+
+// ───────────────────────── GRAPOUT cohort engine ─────────────────────────
+// A Client (end-customer / exporter) owns a mailbox group (EmailAccounts with
+// matching clientId) and a sequence. Each month a Cohort of contacts is enrolled
+// and dripped: dailyBatchSize/day over batchWindowDays, advancing through the
+// sequence steps every stageIntervalDays, rotating across the group's mailboxes.
+
+model Client {
+  id                      String    @id @default(uuid())
+  tenantId                String
+  name                    String
+  invoiceNo               String? // company invoice / account reference
+  invoiceDate             DateTime? // date on the invoice (for filtering / reporting)
+  contactPerson           String? // client-side point of contact (name)
+  email                   String? // client contact email — also the report recipient
+  ownerUserId             String? // client-portal login that owns this profile
+  salesPersonId           String? // the SALES user responsible for this client (nullable = unassigned)
+  operationContacts       Json      @default("[]") // [{ name, email }] — ops people cc'd on the monthly campaign-data reminder
+  lastCampaignReminderAt  DateTime? // guards the monthly "add next month's buyers/suppliers" reminder (once per month)
+  mobile                  String? // client mobile incl. country code
+  productCategory         String? // product / category being exported/imported
+  serviceType             String? // EXPORT | IMPORT | BOTH
+  emailEnabled            Boolean   @default(true) // subscribed to the Email outreach channel
+  linkedInEnabled         Boolean   @default(false) // subscribed to the LinkedIn outreach channel
+  linkedInCreditMetering  Boolean   @default(false) // when true, each LinkedIn lead-sourcing run costs 1 credit
+  // Per-client entitlements (defaulted from the plan, overridable; 0 = unlimited/unset).
+  emailCredits            Int       @default(0)
+  emailCreditMetering     Boolean   @default(false) // when true, each email send debits 1 credit
+  mailboxLimit            Int       @default(0)
+  emailCampaignLimit      Int       @default(0)
+  status                  String    @default("active")
+  plan                    String    @default("Growth")
+  // Setup reporting: months of service bought (0 = not set; 1–12) → generates monthly
+  // "Email arrangement" ops steps. setupNotifiedAt guards the first "notify the team" send.
+  serviceMonths           Int       @default(0)
+  setupNotifiedAt         DateTime?
+  // Onboarding stopwatch shown on the Reporting client box (staff only): start ticks
+  // from workspace creation; finish is stamped once the setup checklist hits 100%.
+  setupStartedAt          DateTime?
+  setupFinishedAt         DateTime?
+  reportDaily             Boolean   @default(false) // email a daily performance report
+  reportWeekly            Boolean   @default(false) // email a weekly report (Mondays)
+  reportMonthly           Boolean   @default(false) // email a monthly report (1st)
+  reportHour              Int       @default(8) // hour-of-day to send the report
+  reportLastDailyAt       DateTime? // guards (one send per period)
+  reportLastWeeklyAt      DateTime?
+  reportLastMonthlyAt     DateTime?
+  termStartedAt           DateTime  @default(now())
+  monthlyQuota            Int       @default(100) // fresh contacts per month
+  dailyBatchSize          Int       @default(10) // fresh sends per day
+  batchWindowDays         Int       @default(10) // days to spread a stage across
+  stageIntervalDays       Int       @default(10) // gap between sequence stages
+  followUpCount           Int       @default(4) // follow-ups after the initial (capped)
+  weekdaysOnly            Boolean   @default(true) // legacy; superseded by workDays (kept for back-compat)
+  workDays                Int[]     @default([1, 2, 3, 4, 5]) // email send days (0=Sun … 6=Sat)
+  emailJitterSeconds      Int       @default(20) // random 0…N sec stagger added to each email send
+  sendWindowStart         Int       @default(9) // send only between these hours (human-like)
+  sendWindowEnd           Int       @default(17)
+  stageIntervalJitterDays Int       @default(2) // ± random days on each follow-up gap
+  autoCohortEnabled       Boolean   @default(false) // auto-create a monthly cohort
+  autoCohortListId        String? // source list for auto cohorts
+  autoCohortDay           Int       @default(1) // day-of-month to create it
+  lastAutoCohortAt        DateTime? // guards once-per-month creation
+  validityDays            Int? // plan validity window in days (30/180/360)
+  validityStartAt         DateTime? // when the validity window began
+  // Postgres-generated: validityStartAt + validityDays. Read-only (never written by
+  // the app) — Postgres keeps it in sync so subscription date/expiry filters can query it.
+  validityEndAt           DateTime? // when the validity window ends (generated column)
+  validityNotifyStage     Int       @default(0) // last expiry-reminder milestone emailed (0..4)
+  // Renewals: incremented each time a new invoice starts a fresh subscription window.
+  // > 0 drives the "Renewed" badge and the Renewed filter in the Clients Workspace.
+  renewalCount            Int       @default(0)
+  lastRenewedAt           DateTime?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  owner               User?                @relation("ClientOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
+  salesPerson         User?                @relation("SalesPerson", fields: [salesPersonId], references: [id], onDelete: SetNull)
+  mailboxes           EmailAccount[]
+  sequenceSteps       SequenceStep[]
+  cohorts             Cohort[]
+  enrollments         Enrollment[]
+  contacts            Contact[]
+  contactLists        ContactList[]
+  templates           EmailTemplate[]
+  campaigns           Campaign[]
+  subAdminAssignments SubAdminAssignment[]
+  liAudiencePresets   LiAudiencePreset[]
+  supportTickets      SupportTicket[]
+  setupSteps          ClientSetupStep[]
+
+  @@index([tenantId])
+  @@index([salesPersonId])
+}
+
+model SequenceStep {
+  id          String  @id @default(uuid())
+  clientId    String
+  cohortId    String? // null = client default template; set = that cohort's own sequence
+  stageOrder  Int // 0 = initial, 1 = FU-1, 2 = FU-2, …
+  templateId  String? // primary variant (= templateIds[0]); kept for back-compat
+  templateIds Json    @default("[]") // per-mailbox template variants (index = mailbox rotation position)
+  monthOffset Int     @default(1) // which month of the cohort this stage sends in (1-based)
+  waitDays    Int     @default(10) // derived business-day gap after the previous stage (engine uses this)
+
+  client   Client         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  cohort   Cohort?        @relation(fields: [cohortId], references: [id], onDelete: Cascade)
+  template EmailTemplate? @relation(fields: [templateId], references: [id])
+
+  @@index([clientId])
+  @@index([cohortId])
+}
+
+model Cohort {
+  id         String       @id @default(uuid())
+  tenantId   String
+  clientId   String
+  label      String
+  monthIndex Int          @default(1)
+  /// Position within the month when a month holds more than one cohort:
+  /// 0 = "A", 1 = "B", … Null means the month has a single cohort and is
+  /// rendered as a plain "#3". Display-only — scheduling never reads it.
+  subIndex   Int?
+  status     CohortStatus @default(RUNNING)
+  startDate  DateTime     @default(now())
+  endedAt    DateTime?
+  createdAt  DateTime     @default(now())
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  client        Client         @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  enrollments   Enrollment[]
+  sequenceSteps SequenceStep[]
+
+  @@index([clientId])
+}
+
+model Enrollment {
+  id          String           @id @default(uuid())
+  tenantId    String
+  clientId    String
+  cohortId    String
+  contactId   String
+  stage       Int              @default(0) // 0 = initial; matches SequenceStep.stageOrder
+  daySlot     Int              @default(1) // 1..batchWindowDays — preserves day order across stages
+  nextTouchAt DateTime
+  status      EnrollmentStatus @default(ACTIVE)
+  lastSentAt  DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  client  Client  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  cohort  Cohort  @relation(fields: [cohortId], references: [id], onDelete: Cascade)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([cohortId, contactId])
+  @@index([tenantId])
+  @@index([status, nextTouchAt])
+}
+
+// ═══════════════════════ LinkedIn Outreach channel (additive) ═══════════════════════
+// Self-contained module for the LinkedIn channel. It references the shared Tenant /
+// Client / User by SCALAR id only (no Prisma relations into them), so no existing model
+// or table is modified — this migration is purely additive (CREATE TABLE only).
+// All names/enums are Li*-prefixed to avoid colliding with the email models above.
+
+enum LinkedInAccountStatus {
+  PENDING // awaiting Unipile hosted-auth completion
+  CONNECTED
+  CREDENTIALS // needs re-auth (cookie expired / checkpoint)
+  DISCONNECTED
+  ERROR
+}
+
+enum LiKnowledgeKind {
+  BUSINESS
+  STRATEGY
+}
+
+enum LiCampaignType {
+  AUTOMATIC
+  MANUAL
+}
+
+enum LiCampaignMode {
+  REGULAR
+  AI
+}
+
+enum LiOutreachType {
+  WITH_CONNECTION
+  DIRECT_MESSAGES
+}
+
+enum LiCampaignStatus {
+  DRAFT
+  RUNNING
+  PAUSED
+  COMPLETED
+  ARCHIVED
+  DELETED
+}
+
+enum LiStepType {
+  CONNECTION_REQUEST
+  MESSAGE
+}
+
+// When a follow-up MESSAGE step should fire, relative to whether the connection
+// invite was accepted. ANY = the normal accepted flow (default; back-compat);
+// IF_ACCEPTED = only when accepted; IF_NOT_ACCEPTED = only when the invite was
+// never accepted (branch), letting a sequence skip one step and send another.
+enum LiStepCondition {
+  ANY
+  IF_ACCEPTED
+  IF_NOT_ACCEPTED
+}
+
+enum LiLeadStatus {
+  PENDING
+  CONNECTION_PENDING
+  CONNECTED
+  MESSAGED
+  REPLIED
+  CAMPAIGN_COMPLETED // finished its own sequence (grace window passed) with no reply
+  NOT_ACCEPTED // connection invite was never accepted within the window (invite withdrawn)
+  BOUNCED
+  EXCLUDED
+}
+
+enum LiSentiment {
+  POSITIVE
+  NEUTRAL
+  NEGATIVE
+}
+
+enum LiMessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum LiMessageSource {
+  AUTO
+  MANUAL
+  AI
+}
+
+enum LiScheduledActionType {
+  SEND_CONNECTION
+  CHECK_ACCEPTANCE
+  SEND_MESSAGE
+  COMPLETE_LEAD // grace-window close: mark CAMPAIGN_COMPLETED if still no reply
+}
+
+enum LiScheduledActionStatus {
+  PENDING
+  QUEUED
+  RUNNING
+  DONE
+  FAILED
+  CANCELLED
+}
+
+enum LiCreditReason {
+  AI_FETCH
+  LEAD_SOURCING
+  TOPUP
+  ADJUSTMENT
+  REFUND
+}
+
+// Separate LinkedIn subscription block for a shared Client — seats / validity / credits
+// filled INDEPENDENTLY of the email plan. 1:1 with Client via a unique scalar clientId.
+model LinkedInSubscription {
+  id               String    @id @default(uuid())
+  tenantId         String
+  clientId         String    @unique
+  planName         String?
+  seats            Int       @default(1)
+  campaignLimit    Int       @default(0) // max LinkedIn campaigns (0 = unlimited)
+  creditsBalance   Int       @default(0)
+  validityDays     Int?
+  validityStartAt  DateTime?
+  whatsappEnabled  Boolean   @default(false)
+  whatsappNumber   String?
+  timezone         String    @default("Asia/Kolkata")
+  // Client-level LinkedIn sending defaults (working hours, caps, warm-up, drip),
+  // set at client registration and inherited by every new campaign. Shape:
+  // { run247, workStartHour, workEndHour, workDays[], dailyConnectionLimit,
+  //   dailyMessageLimit, warmupEnabled, warmupStartLimit, warmupDays,
+  //   dripEnabled, dripDailyTarget, dripBuffer }
+  campaignDefaults Json?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  creditTxns LiCreditTransaction[]
+
+  @@index([tenantId])
+}
+
+model LiCreditTransaction {
+  id             String               @id @default(uuid())
+  subscriptionId String
+  subscription   LinkedInSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  amount         Int
+  reason         LiCreditReason
+  balanceAfter   Int
+  refType        String?
+  refId          String?
+  note           String?
+  createdAt      DateTime             @default(now())
+
+  @@index([subscriptionId])
+}
+
+// A LinkedIn "seat" — one connected account (references shared Client by scalar id).
+model LinkedInAccount {
+  id                String                @id @default(uuid())
+  tenantId          String
+  clientId          String
+  unipileAccountId  String?               @unique
+  status            LinkedInAccountStatus @default(PENDING)
+  fullName          String?
+  headline          String?
+  profileUrl        String?
+  avatarUrl         String?
+  connectionsCount  Int?
+  dailyInviteLimit  Int                   @default(20)
+  dailyMessageLimit Int                   @default(40)
+  /// Hard ceiling on profile-data reads per day for this seat. LinkedIn restricts
+  /// accounts that read "a high volume of profile data", so this is enforced in the
+  /// provider itself — no code path can exceed it. ~100/day is LinkedIn's own line.
+  dailyProfileLimit Int                   @default(80)
+  /// Set when the engine auto-pauses this seat (provider checkpoint, non-OK status,
+  /// or budget exhaustion). Cleared on a successful reconnect.
+  pausedReason      String?
+  pausedAt          DateTime?
+  /// Where this seat's traffic should appear to come from. LinkedIn weighs the login
+  /// location, so a seat reached from a different country than the person normally uses
+  /// draws checkpoints on its own — independent of how carefully the sending is paced.
+  /// ISO 3166-1 alpha-2; null = let Unipile pick from the connecting user's IP.
+  proxyCountry      String?
+  /// Optional bring-your-own proxy, overriding proxyCountry. Password is encrypted
+  /// at rest with CREDENTIAL_ENCRYPTION_KEY and never returned by the API.
+  proxyHost         String?
+  proxyPort         Int?
+  proxyProtocol     String?
+  proxyUsername     String?
+  proxyPassword     String?
+  /// Last time the proxy config above was successfully pushed to the provider.
+  proxyAppliedAt    DateTime?
+  lastSyncedAt      DateTime?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  campaigns LiCampaign[]
+
+  @@index([tenantId])
+  @@index([clientId])
+  @@index([status])
+}
+
+/// Per-seat, per-day meter for provider calls that spend LinkedIn's profile-view
+/// budget. Written by the provider on every profile-consuming call so the cap is
+/// enforced at the seam, not at each call site.
+model LiApiUsage {
+  id           String   @id @default(uuid())
+  /// Unipile account id (the seat), not the local LinkedInAccount row id.
+  accountId    String
+  /// UTC calendar day, "YYYY-MM-DD" — avoids timezone drift on a date column.
+  day          String
+  profileCalls Int      @default(0)
+  inviteCalls  Int      @default(0)
+  messageCalls Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([accountId, day])
+  @@index([accountId])
+}
+
+model LiKnowledgeProfile {
+  id           String               @id @default(uuid())
+  tenantId     String
+  clientId     String
+  kind         LiKnowledgeKind
+  parentId     String?
+  parent       LiKnowledgeProfile?  @relation("LiKnowledgeHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
+  children     LiKnowledgeProfile[] @relation("LiKnowledgeHierarchy")
+  name         String
+  slug         String?
+  content      Json                 @default("{}")
+  completeness Int                  @default(0)
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+
+  messages             LiKnowledgeChatMessage[]
+  businessForCampaigns LiCampaign[]             @relation("LiCampaignBusiness")
+  strategyForCampaigns LiCampaign[]             @relation("LiCampaignStrategy")
+
+  @@index([clientId, kind])
+  @@index([parentId])
+}
+
+model LiKnowledgeChatMessage {
+  id        String             @id @default(uuid())
+  profileId String
+  profile   LiKnowledgeProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  role      String
+  content   String
+  fieldKey  String?
+  createdAt DateTime           @default(now())
+
+  @@index([profileId])
+}
+
+model LiCampaign {
+  id                   String              @id @default(uuid())
+  tenantId             String
+  clientId             String
+  // Nullable on purpose: removing a LinkedIn account must not take its campaigns with
+  // it. The campaign is paused and detached (SetNull), keeping its sequence, audience,
+  // leads and history, and can be pointed at a newly connected account to resume.
+  linkedInAccountId    String?
+  linkedInAccount      LinkedInAccount?    @relation(fields: [linkedInAccountId], references: [id], onDelete: SetNull)
+  name                 String
+  type                 LiCampaignType      @default(AUTOMATIC)
+  mode                 LiCampaignMode      @default(REGULAR)
+  outreachType         LiOutreachType      @default(WITH_CONNECTION)
+  status               LiCampaignStatus    @default(DRAFT)
+  deletedAt            DateTime? // set on soft-delete; auto-purged after 30 days
+  timezone             String              @default("Asia/Kolkata")
+  run247               Boolean             @default(false)
+  workStartHour        Int                 @default(9)
+  workEndHour          Int                 @default(18)
+  workDays             Int[]               @default([1, 2, 3, 4, 5])
+  dailyConnectionLimit Int                 @default(20)
+  dailyMessageLimit    Int                 @default(20)
+  jitterMinSeconds     Int                 @default(20) // min random gap between actions
+  jitterMaxSeconds     Int                 @default(90) // max random gap between actions
+  // Human-likeness: instead of every lead getting all follow-up messages, each lead is
+  // randomly assigned a message count in [followUpMin, followUpMax] at enrollment.
+  // 0/0 = feature off → every lead gets all configured MESSAGE steps.
+  followUpMin          Int                 @default(0)
+  followUpMax          Int                 @default(0)
+  // Grace window (hours) after a lead's last message before it's marked
+  // CAMPAIGN_COMPLETED when no reply arrives. Default 96h / 4 days.
+  graceHours           Int                 @default(96)
+  // Warm-up ramp: start low and grow the daily connection cap to the target over
+  // warmupDays, to protect the account from LinkedIn's invite limits / bans.
+  warmupEnabled        Boolean             @default(true)
+  warmupStartLimit     Int                 @default(5) // connections/day on day 0
+  warmupDays           Int                 @default(14) // days to reach dailyConnectionLimit
+  warmupStartedAt      DateTime? // set when the campaign first goes RUNNING
+  // How long to wait for a connection to be accepted before giving up: the invite
+  // is withdrawn and the lead marked NOT_ACCEPTED. 1–30 days.
+  connectionWindowDays Int                 @default(5)
+  // Health guard. A low acceptance rate is the signal LinkedIn punishes hardest —
+  // ignored invites and "I don't know this person" are what turn a well-paced campaign
+  // into a restricted account — and it is driven by targeting and copy, which no amount
+  // of rate limiting fixes. Percent; 0 = off.
+  minAcceptanceRate    Int                 @default(25)
+  // Only invites sent after this point count toward the guard. Stamped whenever the
+  // campaign starts or resumes, so a resumed campaign builds a fresh sample instead of
+  // being re-paused instantly by the same history that paused it.
+  acceptanceGateFrom   DateTime?
+  // Why the engine paused this campaign (null = a person paused it).
+  pausedReason         String?
+  // Lead-quality gate: skip (EXCLUDE) leads whose LinkedIn connection count is below
+  // this before sending an invite — the engine already fetches the profile at contact
+  // time, so it costs nothing. 0 = off. Leads with a hidden/unknown count still pass.
+  minConnections       Int                 @default(0)
+  // Upper bound of the same gate: skip leads ABOVE this many connections. People at/near
+  // LinkedIn's 30k cap can't accept new invites (the request fails), so excluding them
+  // avoids wasted, failing sends. 0 = off. Hidden/unknown counts still pass.
+  maxConnections       Int                 @default(0)
+  // Background drip-sourcer: auto-refill the Target Audience from LinkedIn search.
+  dripEnabled          Boolean             @default(false)
+  dripDailyTarget      Int                 @default(25) // max leads to source per day
+  dripBuffer           Int                 @default(50) // only refill when PENDING is below this
+  lastDripAt           DateTime? // last successful auto-source
+  // Daily-pull scheduler: the window-open of the last day we've scheduled connection
+  // requests for. The pull is idempotent — it only schedules a day if that day is newer
+  // than this. Null = never pulled (first tick migrates off any legacy pre-scheduled pile).
+  scheduledThrough     DateTime?
+  businessProfileId    String?
+  businessProfile      LiKnowledgeProfile? @relation("LiCampaignBusiness", fields: [businessProfileId], references: [id])
+  strategyId           String?
+  strategy             LiKnowledgeProfile? @relation("LiCampaignStrategy", fields: [strategyId], references: [id])
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+
+  audienceSpec LiTargetAudienceSpec?
+  steps        LiSequenceStep[]
+  leads        LiLead[]
+
+  @@index([tenantId])
+  @@index([clientId, status])
+  @@index([linkedInAccountId])
+}
+
+model LiTargetAudienceSpec {
+  id                     String     @id @default(uuid())
+  campaignId             String     @unique
+  campaign               LiCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  countries              String[]   @default([])
+  cities                 String[]   @default([])
+  industries             String[]   @default([])
+  companySizes           String[]   @default([])
+  departments            String[]   @default([])
+  jobTitles              String[]   @default([])
+  seniorities            String[]   @default([])
+  companyKeywordsInclude String[]   @default([])
+  companyKeywordsExclude String[]   @default([])
+  personKeywordsInclude  String[]   @default([])
+  personKeywordsExclude  String[]   @default([])
+  createdAt              DateTime   @default(now())
+  updatedAt              DateTime   @updatedAt
+}
+
+model LiSequenceStep {
+  id         String          @id @default(uuid())
+  campaignId String
+  campaign   LiCampaign      @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  order      Int
+  type       LiStepType
+  condition  LiStepCondition @default(ANY) // when a MESSAGE step fires (accept branch)
+  waitHours  Int             @default(0)
+  body       String?
+  note       String?
+  // Alternate wordings for this step (human-likeness). One is picked at random per
+  // lead at send time from [body/note, ...variants], so no single string repeats to
+  // the whole audience. Empty = single fixed wording (back-compat).
+  variants   String[]        @default([])
+  // Random-choice grouping: MESSAGE steps sharing the same non-null randomGroup are
+  // alternatives — exactly ONE of the group is sent per lead (picked at random, using
+  // that member's own waitHours). Null = a normal, always-sent step. Lets a sequence
+  // offer e.g. "FU-2 (24h) OR FU-3 (48h) — pick one" for a more human, varied cadence.
+  randomGroup Int?
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+
+  @@unique([campaignId, order])
+  @@index([campaignId])
+}
+
+model LiLead {
+  id                  String       @id @default(uuid())
+  campaignId          String
+  campaign            LiCampaign   @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  fullName            String
+  firstName           String?
+  lastName            String?
+  title               String?
+  company             String?
+  location            String?
+  profileUrl          String?
+  avatarUrl           String?
+  unipileMemberId     String?
+  unipileInvitationId String? // sent-invite id, used to withdraw a never-accepted invite
+  status              LiLeadStatus @default(PENDING)
+  currentStep         Int          @default(0)
+  // How many MESSAGE steps THIS lead will receive, drawn once from the campaign's
+  // [followUpMin, followUpMax] at first schedule. Null until resolved (= all steps).
+  assignedMessages    Int?
+  // LinkedIn connection count, captured when the engine resolves the profile at contact
+  // time. Null = unknown/hidden. Used by the campaign's minConnections quality gate.
+  connectionsCount    Int?
+  sentiment           LiSentiment?
+  intent              String?
+  connectedAt         DateTime?
+  lastActionAt        DateTime?
+  lastReplyAt         DateTime?
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+
+  conversation LiConversation?
+  aiFetches    LiAiFetch[]
+  scheduled    LiScheduledAction[]
+
+  // A profile can't appear twice in the same campaign's audience. (Postgres treats
+  // NULLs as distinct, so leads without a profileUrl aren't blocked.)
+  @@unique([campaignId, profileUrl])
+  @@index([campaignId, status])
+  @@index([status])
+}
+
+model LiConversation {
+  id            String    @id @default(uuid())
+  leadId        String    @unique
+  lead          LiLead    @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  unipileChatId String?   @unique
+  unreadCount   Int       @default(0)
+  needsReply    Boolean   @default(false)
+  lastReplyAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  messages LiMessage[]
+
+  @@index([needsReply])
+}
+
+model LiMessage {
+  id               String             @id @default(uuid())
+  conversationId   String
+  conversation     LiConversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  direction        LiMessageDirection
+  source           LiMessageSource    @default(AUTO)
+  body             String
+  unipileMessageId String?            @unique
+  sentAt           DateTime           @default(now())
+  createdAt        DateTime           @default(now())
+
+  @@index([conversationId])
+}
+
+model LiAiFetch {
+  id         String       @id @default(uuid())
+  leadId     String
+  lead       LiLead       @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  intent     String?
+  sentiment  LiSentiment?
+  enrichment Json?
+  draftReply String?
+  creditCost Int          @default(1)
+  createdAt  DateTime     @default(now())
+
+  @@index([leadId])
+}
+
+model LiScheduledAction {
+  id        String                  @id @default(uuid())
+  leadId    String
+  lead      LiLead                  @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  type      LiScheduledActionType
+  status    LiScheduledActionStatus @default(PENDING)
+  stepOrder Int?
+  runAt     DateTime
+  jobId     String?
+  attempts  Int                     @default(0)
+  lastError String?
+  createdAt DateTime                @default(now())
+  updatedAt DateTime                @updatedAt
+
+  @@index([status, runAt])
+  @@index([leadId])
+}
+
+// ───────────────── Client Support (tickets + two-way chat) ─────────────────
+// A client raises a ticket from the portal; it becomes a threaded conversation
+// with the client's assigned salesperson (or admins/sub-admins if unassigned).
+// Sales can escalate to admin/sub-admin, who resolve back. Attachments are
+// stored as DB blobs (private — never in webroot) and served via a gated route.
+enum SupportStatus {
+  OPEN
+  ANSWERED
+  RESOLVED
+  CLOSED
+}
+
+enum SupportSatisfaction {
+  SATISFIED
+  NOT_SATISFIED
+}
+
+enum SupportReplyRole {
+  CLIENT
+  SUPPORT
+}
+
+model SupportTicket {
+  id               String               @id @default(uuid())
+  tenantId         String
+  userId           String // the client-portal login who raised it
+  clientId         String? // the client workspace it belongs to (resolves salesperson / company / phone)
+  subject          String
+  category         String?
+  status           SupportStatus        @default(OPEN)
+  assignedToId     String? // the current handler (salesperson, admin, or sub-admin)
+  satisfaction     SupportSatisfaction?
+  satisfactionNote String?
+  lastReplyAt      DateTime             @default(now())
+  lastReplyRole    SupportReplyRole     @default(CLIENT)
+  escalatedAt      DateTime?
+  escalatedById    String?
+  escalationNote   String?
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+
+  tenant      Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user        User             @relation("TicketOwner", fields: [userId], references: [id], onDelete: Cascade)
+  client      Client?          @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  assignedTo  User?            @relation("TicketAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  escalatedBy User?            @relation("TicketEscalator", fields: [escalatedById], references: [id], onDelete: SetNull)
+  messages    SupportMessage[]
+
+  @@index([tenantId, status])
+  @@index([userId])
+  @@index([assignedToId])
+  @@index([clientId])
+}
+
+model SupportMessage {
+  id             String   @id @default(uuid())
+  ticketId       String
+  userId         String // the author of this message
+  body           String   @db.Text
+  attachmentData Bytes? // private blob (nullable); served only through the gated download route
+  attachmentName String?
+  attachmentMime String?
+  createdAt      DateTime @default(now())
+
+  ticket SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  user   User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+}
+
+// ───────────────── Admin Broadcasts (one-way Notification to clients) ─────────────────
+// An admin composes a titled, rich-HTML notification and sends it to a target
+// audience (all clients, a service segment, a plan, or one specific client). It is
+// delivered to each targeted client's portal "Notification" page, plus an optional
+// in-app bell alert / email / WhatsApp (each gated by the broadcast toggle AND the
+// recipient's own notification preferences). One-directional — clients cannot reply.
+enum BroadcastAudience {
+  ALL // every client
+  CHANNEL // by outreach channel (EMAIL / LINKEDIN)
+  PLAN // all clients on a plan
+  CLIENT // one specific client
+}
+
+model Broadcast {
+  id              String            @id @default(uuid())
+  tenantId        String
+  title           String
+  bodyHtml        String
+  signatureHtml   String?
+  audience        BroadcastAudience @default(ALL)
+  channel         String? // when audience = CHANNEL: EMAIL | LINKEDIN
+  plan            String? // when audience = PLAN
+  clientId        String? // when audience = CLIENT: the specific client
+  audienceLabel   String? // denormalized human label for the sent list
+  status          String            @default("DRAFT") // DRAFT | SENT
+  sentAt          DateTime? // when it was actually delivered (null while a draft)
+  showInApp       Boolean           @default(true)
+  sendEmail       Boolean           @default(true)
+  sendWhatsapp    Boolean           @default(false)
+  sendTelegram    Boolean           @default(false)
+  sendNetvork     Boolean           @default(false)
+  createdByUserId String
+  createdByName   String?
+  recipientCount  Int               @default(0)
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  tenant     Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  recipients BroadcastRecipient[]
+
+  @@index([tenantId, createdAt])
+}
+
+model BroadcastRecipient {
+  id          String    @id @default(uuid())
+  broadcastId String
+  userId      String // the client-portal login who receives it
+  clientId    String? // the client profile it was sent about (for display)
+  readAt      DateTime?
+  createdAt   DateTime  @default(now())
+
+  broadcast Broadcast @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([broadcastId])
+}
+
+// ───────────────── Internal Work (admin-only notes / discussion) ─────────────────
+// A private board for the agency: notes about a client, hand-offs and internal
+// discussion between admins and sub-admins. Same composer as an admin Broadcast
+// (title + rich body + drafts + in-app/email), but clients NEVER see these.
+enum InternalNoteAudience {
+  ALL_STAFF // every admin + sub-admin
+  ALL_STAFF_SALES // every admin, sub-admin & salesperson
+  USER // one specific staff member (admin / sub-admin / salesperson)
+}
+
+model InternalNote {
+  id              String               @id @default(uuid())
+  tenantId        String
+  title           String
+  bodyHtml        String
+  clientId        String? // the client this note is about (optional)
+  clientName      String? // denormalized so the list still reads well if the client goes
+  audience        InternalNoteAudience @default(ALL_STAFF)
+  targetUserId    String? // when audience = USER
+  audienceLabel   String? // denormalized human label for the list
+  status          String               @default("DRAFT") // DRAFT | POSTED
+  postedAt        DateTime?
+  showInApp       Boolean              @default(true)
+  sendEmail       Boolean              @default(false)
+  createdByUserId String
+  createdByName   String?
+  recipientCount  Int                  @default(0)
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  tenant     Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  recipients InternalNoteRecipient[]
+  messages   InternalNoteMessage[]
+
+  @@index([tenantId, createdAt])
+}
+
+// A chat message in an internal note's thread — multi-way discussion between the
+// note's participants (admins / sub-admins / salespersons). The note's bodyHtml is
+// the opening post; these are the replies.
+model InternalNoteMessage {
+  id         String   @id @default(uuid())
+  noteId     String
+  userId     String // author (a staff user)
+  authorName String? // denormalized for display
+  body       String   @db.Text
+  createdAt  DateTime @default(now())
+
+  note InternalNote @relation(fields: [noteId], references: [id], onDelete: Cascade)
+
+  @@index([noteId])
+}
+
+model InternalNoteRecipient {
+  id        String    @id @default(uuid())
+  noteId    String
+  userId    String
+  readAt    DateTime? // unread marker (reset to null on each new message)
+  seenAt    DateTime? // monotonic last-seen time, for per-message read receipts
+  createdAt DateTime  @default(now())
+
+  note InternalNote @relation(fields: [noteId], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([noteId])
+}
+
+// ───────────────── Client-workspace setup reporting (onboarding tracker) ─────────────────
+// A per-client checklist of onboarding steps (registration → email setup → LinkedIn setup),
+// each owned by a "concern person" and moved through NOT_STARTED → STARTED → FINISHED. The
+// managed default list (SetupStepTemplate) seeds every client; a client's applicable steps
+// depend on its enabled channels (email / LinkedIn). Progress % powers the Workspace Box bar.
+
+enum SetupGroup {
+  GENERAL
+  EMAIL
+  LINKEDIN
+  MONTHLY // recurring per-month "email arrangement" work (internal ops; excluded from the client %)
+}
+
+enum SetupStatus {
+  NOT_STARTED
+  STARTED
+  FINISHED
+}
+
+// Managed default checklist for a tenant — new/edited steps here apply to every client.
+model SetupStepTemplate {
+  id        String     @id @default(uuid())
+  tenantId  String
+  key       String // stable slug (also links client instances back to their template step)
+  label     String
+  group     SetupGroup @default(GENERAL)
+  order     Int        @default(0)
+  active    Boolean    @default(true)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@unique([tenantId, key])
+  @@index([tenantId])
+}
+
+// One onboarding step for one client. `templateKey` links to the default step it came from
+// (null = a per-client custom extra). Cascade-deleted with the client.
+model ClientSetupStep {
+  id             String      @id @default(uuid())
+  tenantId       String
+  clientId       String
+  templateKey    String? // null = custom per-client step
+  label          String
+  group          SetupGroup  @default(GENERAL)
+  order          Int         @default(0)
+  monthIndex     Int? // for MONTHLY steps: 1..12 (the service month this arrangement covers)
+  lastReminderAt DateTime? // last time the assignee was nudged about this (monthly) step
+  hidden         Boolean     @default(false) // per-client hide: drop a default step from THIS client (sticks across re-syncs)
+  status         SetupStatus @default(NOT_STARTED)
+  assigneeUserId String? // the "concern person" (a staff user)
+  assigneeName   String?
+  assigneeEmail  String?
+  assigneeRole   String?
+  startedAt      DateTime? // first time it moved to STARTED
+  finishedAt     DateTime? // when it reached FINISHED
+  updatedByName  String? // who last changed status/assignee
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  client Client             @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  events ClientSetupEvent[]
+
+  @@unique([clientId, templateKey]) // one instance per template step per client (nulls stay distinct → many custom steps allowed)
+  @@index([clientId])
+  @@index([tenantId])
+}
+
+// Audit trail: who moved a step to which status, and when.
+model ClientSetupEvent {
+  id          String      @id @default(uuid())
+  stepId      String
+  status      SetupStatus
+  actorUserId String?
+  actorName   String
+  at          DateTime    @default(now())
+
+  step ClientSetupStep @relation(fields: [stepId], references: [id], onDelete: Cascade)
+
+  @@index([stepId])
+}
+
+/// What a client-portal change request does once approved.
+enum ClientChangeKind {
+  SEQUENCE // replace the client's default sequence
+  COHORT_SEQUENCE // replace one cohort's own sequence
+  SETTINGS // apply operational client settings
+  COHORT_STOP // stop a cohort permanently
+  COHORT_DELETE // delete a cohort and its enrollments
+  CONTACT_CREATE // add one contact (optionally into a list)
+  CONTACT_UPDATE // edit one contact's fields / lists
+  CONTACT_DELETE // delete one contact
+  CONTACT_BULK_DELETE // delete several contacts
+  LIST_CREATE // create a contact list
+  LIST_DELETE // delete a contact list (contacts are kept)
+  LIST_MEMBERS_ADD // add contacts to a list
+  LIST_MEMBERS_REMOVE // remove contacts from a list
+  LI_REPLY // send a LinkedIn inbox reply
+  LI_CAMPAIGN_ARCHIVE // archive a LinkedIn campaign
+  LI_CAMPAIGN_DELETE // soft-delete a LinkedIn campaign
+  LI_ACCOUNT_CONNECT // permission to connect a LinkedIn account
+}
+
+/// A change made in the client portal, held for admin/sub-admin review
+/// (ApprovalEntity.CLIENT_CHANGE). Nothing in `payload` takes effect until the
+/// approval is approved; the live sequence/settings/cohort keep running as-is.
+model ClientChangeRequest {
+  id            String           @id @default(uuid())
+  tenantId      String
+  clientId      String
+  requestedById String
+  kind          ClientChangeKind
+  targetId      String? // the cohort, for cohort-scoped kinds
+  summary       String // one line for the Approvals list
+  payload       Json             @default("{}")
+  createdAt     DateTime         @default(now())
+
+  @@index([tenantId])
+  @@index([clientId, kind, targetId])
+}
