@@ -8,13 +8,13 @@
    hit that once kept hitting it, cached, with no way to clear it themselves.
    Renaming the cache is what frees them: activate deletes every cache that is
    not this one. */
-/* Stamped at build time (vite.config.ts replaces mu6uyz6t). Every
+/* Stamped at build time (vite.config.ts replaces mu89e4g9). Every
    deploy therefore ships a byte-different sw.js, which is the only thing that
    makes the browser install the new worker and run activate below — where the
    previous deploy's cache is thrown away. Without the stamp the file is
    identical every build, the browser sees no change, and the old worker (and
    its old cached app) lives on until the user unregisters it by hand. */
-const SW_VERSION = 'mu6uyz6t'
+const SW_VERSION = 'mu89e4g9'
 const CACHE = 'mypa-static-' + SW_VERSION
 
 self.addEventListener('install', (event) => {

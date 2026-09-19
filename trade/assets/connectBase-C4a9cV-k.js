@@ -1,0 +1,1 @@
+import{Or as e}from"./index-zvvVRi67.js";function t(){let{pathname:t}=e();return``}export{t};
